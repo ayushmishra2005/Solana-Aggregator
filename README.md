@@ -12,7 +12,7 @@ This project implements a Solana Aggregator that fetches blocks from a Solana No
 - **Server**: Handles various APIs and fetches data based on the query.
 
 ### Sequence Diagram
-![solana.png](..%2F..%2F..%2FDownloads%2Fsolana.png)
+![solana](https://github.com/user-attachments/assets/6138169b-f408-44f0-a6c8-ce7149403641)
 
 ### Features
 
