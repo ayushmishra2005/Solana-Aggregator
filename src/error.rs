@@ -22,7 +22,9 @@ pub enum AggError {
     InvalidBalanceMetadata,
     InvalidChunk,
     ConflictingChunk,
+    ConflictingBlock,
     WriteFailed,
+    IncompatibleStorage(String),
 }
 
 impl Display for AggError {
@@ -45,7 +47,9 @@ impl Display for AggError {
             AggError::InvalidBalanceMetadata => "Invalid balance metadata".to_string(),
             AggError::InvalidChunk => "Invalid block chunk".to_string(),
             AggError::ConflictingChunk => "Conflicting block chunk".to_string(),
+            AggError::ConflictingBlock => "Stored block does not match this block".to_string(),
             AggError::WriteFailed => "Block write failed".to_string(),
+            AggError::IncompatibleStorage(message) => message.clone(),
             AggError::ServerError(err) => format!("Server Error {}", err),
         };
         write!(f, "{}", err_mgs)
@@ -74,7 +78,9 @@ impl Debug for AggError {
             AggError::InvalidBalanceMetadata => "Invalid balance metadata".to_string(),
             AggError::InvalidChunk => "Invalid block chunk".to_string(),
             AggError::ConflictingChunk => "Conflicting block chunk".to_string(),
+            AggError::ConflictingBlock => "Stored block does not match this block".to_string(),
             AggError::WriteFailed => "Block write failed".to_string(),
+            AggError::IncompatibleStorage(message) => message.clone(),
             AggError::ServerError(err) => format!("Server Error {:?}", err),
         };
         write!(f, "{}", err_mgs)

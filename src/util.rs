@@ -122,6 +122,10 @@ impl Block {
         self.tx_map.keys().cloned().collect()
     }
 
+    pub fn transaction_ids(&self) -> impl Iterator<Item = &String> {
+        self.tx_map.keys()
+    }
+
     pub fn get_account_balance(&self, account: &str) -> Option<u64> {
         if let Some(account_map) = &self.account_map {
             account_map.get(account).cloned()

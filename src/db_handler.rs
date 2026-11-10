@@ -1,11 +1,34 @@
 use crate::error::AggError;
 use crate::util::{Block, ProtocolMessage};
-use log::{debug, error};
+use log::error;
 use serde_json::{from_slice, to_vec};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const LATEST_BLOCK_NO_KEY: &str = "lst_blk_no";
+const STORAGE_FORMAT_KEY: &str = "solana_agg_storage_format";
+const STORAGE_FORMAT_VERSION: &str = "canonical-signature-v1";
+
+enum ExistingBlock {
+    Absent,
+    Same,
+}
+
+enum StoreFailure {
+    Conflict,
+    Database(rocksdb::Error),
+    Json(serde_json::Error),
+    Incompatible(String),
+}
+
+fn store_failure(failure: StoreFailure) -> AggError {
+    match failure {
+        StoreFailure::Conflict => AggError::ConflictingBlock,
+        StoreFailure::Database(err) => AggError::DbError(err),
+        StoreFailure::Json(err) => AggError::JsonError(err),
+        StoreFailure::Incompatible(message) => AggError::IncompatibleStorage(message),
+    }
+}
 
 pub struct RocksDb {
     db: rocksdb::DB,
@@ -13,6 +36,7 @@ pub struct RocksDb {
     outcome_sender: Option<UnboundedSender<ProtocolMessage>>,
     temp_db: BTreeSet<u64>,
     fail_next_write: bool,
+    fail_next_serialization: bool,
 }
 
 impl RocksDb {
@@ -32,13 +56,18 @@ impl RocksDb {
         receiver: UnboundedReceiver<ProtocolMessage>,
     ) -> Result<Self, AggError> {
         let db = rocksdb::DB::open_default(&path)?;
-        Ok(Self {
+        let database = Self {
             db,
             receiver,
             outcome_sender: None,
             temp_db: Default::default(),
             fail_next_write: false,
-        })
+            fail_next_serialization: false,
+        };
+        database
+            .ensure_storage_format(&path)
+            .map_err(store_failure)?;
+        Ok(database)
     }
 
     pub fn set_block_outcomes(&mut self, sender: UnboundedSender<ProtocolMessage>) {
@@ -48,6 +77,11 @@ impl RocksDb {
     #[cfg(test)]
     pub fn inject_write_failure(&mut self) {
         self.fail_next_write = true;
+    }
+
+    #[cfg(test)]
+    pub fn inject_serialization_failure(&mut self) {
+        self.fail_next_serialization = true;
     }
 
     /// This function runs the RocksDb client
@@ -295,54 +329,236 @@ impl RocksDb {
             self.fail_next_write = false;
             return Err(AggError::WriteFailed);
         }
-        if let Some(latest_block) = self.get_latest_block() {
-            debug!("Latest block no {:?}", latest_block);
-            if block_no == latest_block.saturating_add(1) {
-                debug!("Added to db {:?}", block_no);
-                self.add_block(block_no, &block)?;
-                self.update_latest_block_no_and_account_map(block_no)?;
-            } else {
-                self.temp_db.insert(block_no);
-                self.add_block(block_no, &block)?;
-            }
-        } else {
-            debug!("Updated latest block no first time{:?}", block_no);
-            self.add_block(block_no, &block)?;
-            self.update_latest_block_no_and_account_map(block_no)?;
+        if self.fail_next_serialization {
+            self.fail_next_serialization = false;
+            return Err(AggError::JsonError(
+                serde_json::from_str::<u64>("not-json").expect_err("invalid json"),
+            ));
         }
-        self.add_transactions(block, block_no)?;
-        if !self.temp_db.is_empty() {
-            let mut block_to_removed = vec![];
-            for block_no in self.temp_db.iter() {
-                if block_no.saturating_sub(1)
-                    == self.get_latest_block().ok_or(AggError::NoBlockFinalised)?
-                {
-                    self.update_latest_block_no_and_account_map(*block_no)?;
-                    block_to_removed.push(*block_no);
-                }
+        match self
+            .existing_block_status(block_no, &block)
+            .map_err(store_failure)?
+        {
+            ExistingBlock::Same => return Ok(()),
+            ExistingBlock::Absent => {}
+        }
+        self.reject_foreign_signature_indexes(block_no, &block)
+            .map_err(store_failure)?;
+
+        let mut latest = self.get_latest_block();
+        let mut planned: BTreeMap<u64, Block> = BTreeMap::new();
+        let mut buffered = BTreeSet::new();
+        if Self::extends_latest(latest, block_no) {
+            let snapshot = self.cumulative_block(&planned, latest, block);
+            latest = Some(block_no);
+            planned.insert(block_no, snapshot);
+        } else {
+            buffered.insert(block_no);
+            planned.insert(block_no, block);
+        }
+        buffered.extend(self.temp_db.iter().copied());
+        let mut promoted = Vec::new();
+        while let Some(latest_no) = latest {
+            let next = latest_no.saturating_add(1);
+            if !buffered.contains(&next) || planned.contains_key(&next) {
+                break;
             }
-            for block_no in block_to_removed {
-                self.temp_db.remove(&block_no);
+            let Some(existing) = self.get_block(next) else {
+                break;
+            };
+            let snapshot = self.cumulative_block(&planned, latest, existing);
+            buffered.remove(&next);
+            promoted.push(next);
+            planned.insert(next, snapshot);
+            latest = Some(next);
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+        for (number, record) in &planned {
+            batch.put(
+                format!("BlockNo{number}"),
+                to_vec(record)
+                    .map_err(StoreFailure::Json)
+                    .map_err(store_failure)?,
+            );
+            for signature in record.transaction_ids() {
+                batch.put(
+                    to_vec(signature)
+                        .map_err(StoreFailure::Json)
+                        .map_err(store_failure)?,
+                    to_vec(number)
+                        .map_err(StoreFailure::Json)
+                        .map_err(store_failure)?,
+                );
+            }
+        }
+        if self.get_latest_block() != latest {
+            if let Some(latest_no) = latest {
+                batch.put(
+                    LATEST_BLOCK_NO_KEY,
+                    to_vec(&latest_no)
+                        .map_err(StoreFailure::Json)
+                        .map_err(store_failure)?,
+                );
+            }
+        }
+        self.db
+            .write_opt(batch, &Self::durable_write_options())
+            .map_err(StoreFailure::Database)
+            .map_err(store_failure)?;
+        for block_no in buffered {
+            if planned.contains_key(&block_no) {
+                self.temp_db.insert(block_no);
+            }
+        }
+        for block_no in promoted {
+            self.temp_db.remove(&block_no);
+        }
+        Ok(())
+    }
+
+    /// Sync the WAL before a block acknowledgment. The WAL stays enabled.
+    /// `set_sync(true)` waits for the write to leave the OS page cache, so the
+    /// acknowledgment is not returned while the batch exists only in memory.
+    fn durable_write_options() -> rocksdb::WriteOptions {
+        let mut options = rocksdb::WriteOptions::new();
+        options.set_sync(true);
+        options
+    }
+
+    fn ensure_storage_format(&self, path: &str) -> Result<(), StoreFailure> {
+        match self
+            .db
+            .get(STORAGE_FORMAT_KEY)
+            .map_err(StoreFailure::Database)?
+        {
+            Some(bytes) => {
+                let version = String::from_utf8(bytes).unwrap_or_default();
+                if version != STORAGE_FORMAT_VERSION {
+                    return Err(Self::incompatible_storage(path, &version));
+                }
+                Ok(())
+            }
+            None if self.database_has_records()? => {
+                Err(Self::incompatible_storage(path, "unversioned"))
+            }
+            None => {
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.put(STORAGE_FORMAT_KEY, STORAGE_FORMAT_VERSION);
+                self.db
+                    .write_opt(batch, &Self::durable_write_options())
+                    .map_err(StoreFailure::Database)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn incompatible_storage(path: &str, found: &str) -> StoreFailure {
+        StoreFailure::Incompatible(format!(
+            "Incompatible RocksDB at {path}: found {found}, expected {STORAGE_FORMAT_VERSION}. Use a fresh database directory or reindex explicitly. Existing records were not migrated or overwritten."
+        ))
+    }
+
+    fn database_has_records(&self) -> Result<bool, StoreFailure> {
+        match self.db.iterator(rocksdb::IteratorMode::Start).next() {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(err)) => Err(StoreFailure::Database(err)),
+            None => Ok(false),
+        }
+    }
+
+    fn existing_block_status(
+        &self,
+        block_no: u64,
+        incoming: &Block,
+    ) -> Result<ExistingBlock, StoreFailure> {
+        let Some(stored) = self.get_block(block_no) else {
+            return Ok(ExistingBlock::Absent);
+        };
+        if Self::same_transactions(&stored, incoming) && Self::same_observations(&stored, incoming)
+        {
+            Ok(ExistingBlock::Same)
+        } else {
+            Err(StoreFailure::Conflict)
+        }
+    }
+
+    fn same_transactions(stored: &Block, incoming: &Block) -> bool {
+        let stored_ids: Vec<&String> = stored.transaction_ids().collect();
+        let incoming_ids: Vec<&String> = incoming.transaction_ids().collect();
+        if stored_ids.len() != incoming_ids.len() {
+            return false;
+        }
+        incoming
+            .transaction_ids()
+            .all(|signature| stored.get_tx_details(signature) == incoming.get_tx_details(signature))
+    }
+
+    fn same_observations(stored: &Block, incoming: &Block) -> bool {
+        let Some(incoming_accounts) = incoming.get_account_map() else {
+            return true;
+        };
+        let Some(stored_accounts) = stored.get_account_map() else {
+            return incoming_accounts.is_empty();
+        };
+        incoming_accounts
+            .iter()
+            .all(|(account, balance)| stored_accounts.get(account) == Some(balance))
+    }
+
+    fn reject_foreign_signature_indexes(
+        &self,
+        block_no: u64,
+        block: &Block,
+    ) -> Result<(), StoreFailure> {
+        for signature in block.transaction_ids() {
+            let Some(bytes) = self
+                .db
+                .get(to_vec(signature).map_err(StoreFailure::Json)?)
+                .map_err(StoreFailure::Database)?
+            else {
+                continue;
+            };
+            let indexed_block = from_slice::<u64>(&bytes).map_err(StoreFailure::Json)?;
+            if indexed_block != block_no {
+                return Err(StoreFailure::Conflict);
             }
         }
         Ok(())
     }
 
-    /// This function adds the transactions
-    ///
-    /// # Arguments
-    ///
-    /// * `block` - A Block that holds the block
-    /// * `block_no` - A u64 that holds the block number
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), AggError>` - A Result that holds the result or an error
-    fn add_transactions(&mut self, block: Block, block_no: u64) -> Result<(), AggError> {
-        for tx in block.get_tx_hash() {
-            self.db.put(to_vec(&tx)?, to_vec(&block_no).unwrap())?;
+    fn extends_latest(latest: Option<u64>, block_no: u64) -> bool {
+        match latest {
+            None => true,
+            Some(latest) => block_no == latest.saturating_add(1),
         }
-        Ok(())
+    }
+
+    fn cumulative_block(
+        &self,
+        planned: &BTreeMap<u64, Block>,
+        previous: Option<u64>,
+        mut block: Block,
+    ) -> Block {
+        let mut account_map = BTreeMap::new();
+        if let Some(previous) = previous {
+            if let Some(planned_block) = planned.get(&previous) {
+                if let Some(accounts) = planned_block.get_account_map() {
+                    account_map.clone_from(&accounts);
+                }
+            } else if let Some(stored) = self.get_block(previous) {
+                if let Some(accounts) = stored.get_account_map() {
+                    account_map.clone_from(&accounts);
+                }
+            }
+        }
+        if let Some(observed) = block.get_account_map() {
+            for (account, balance) in observed {
+                account_map.insert(account, balance);
+            }
+        }
+        block.set_account_map(account_map);
+        block
     }
 
     /// This function gets the block
@@ -373,57 +589,6 @@ impl RocksDb {
         } else {
             None
         }
-    }
-
-    /// This function adds the block
-    ///
-    /// # Arguments
-    ///
-    /// * `block_no` - A u64 that holds the block number
-    /// * `block` - A Block that holds the block
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), AggError>` - A Result that holds the result or an error
-    fn add_block(&self, block_no: u64, block: &Block) -> Result<(), AggError> {
-        self.db
-            .put(format!("BlockNo{}", block_no), to_vec(block).unwrap())?;
-        Ok(())
-    }
-
-    /// This function updates the latest block number and account map
-    ///
-    /// # Arguments
-    ///
-    /// * `block_no` - A u64 that holds the block number
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), AggError>` - A Result that holds the result or an error
-    fn update_latest_block_no_and_account_map(&self, block_no: u64) -> Result<(), AggError> {
-        if let Some(mut latest_block) = self.get_block(block_no) {
-            let mut account_map = BTreeMap::new();
-            if let Some(last_block_no) = self.get_latest_block() {
-                if let Some(last_block) = self.get_block(last_block_no) {
-                    if let Some(last_account_map) = last_block.get_account_map() {
-                        println!("Size of AccountMap {:?}", last_account_map.len());
-                        account_map = last_account_map;
-                    }
-                }
-            }
-            if let Some(block_account_map) = latest_block.get_account_map() {
-                for (account, balance) in block_account_map.iter() {
-                    account_map.insert(account.to_string(), *balance);
-                }
-            }
-            latest_block.set_account_map(account_map);
-            self.add_block(block_no, &latest_block)?;
-            self.db
-                .put(LATEST_BLOCK_NO_KEY, to_vec(&block_no).unwrap())?;
-        } else {
-            return Err(AggError::BlockNotFound);
-        }
-        Ok(())
     }
 
     /// This function handles the error
@@ -464,13 +629,16 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
+            static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "solana-agg-signature-index-{}-{}",
+                "solana-agg-signature-index-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("system time")
-                    .as_nanos()
+                    .as_nanos(),
+                TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).expect("create temp database directory");
             Self { path }
@@ -701,5 +869,166 @@ mod tests {
             Ok(ProtocolMessage::TxDetails(_))
         ));
         assert!(db.get_block(4).is_some());
+    }
+
+    fn signature_key_count(db: &RocksDb) -> usize {
+        db.db
+            .iterator(rocksdb::IteratorMode::Start)
+            .filter_map(|item| item.ok())
+            .filter(|(key, _)| {
+                let key = String::from_utf8_lossy(key);
+                key != super::STORAGE_FORMAT_KEY
+                    && key != super::LATEST_BLOCK_NO_KEY
+                    && !key.starts_with("BlockNo")
+            })
+            .count()
+    }
+
+    #[test]
+    fn atomic_block_write_is_readable_after_reopen() {
+        let directory = TempDir::new();
+        let path = directory.path.to_string_lossy().to_string();
+        let (first, first_encoded) = signed_transfer(1_000, 5_000);
+        let (second, second_encoded) = signed_transfer(2_000, 6_000);
+        let first_signature = first.signatures[0].to_string();
+        let second_signature = second.signatures[0].to_string();
+        let block = parse_chunk(vec![first_encoded, second_encoded]);
+        let balance = block
+            .get_account_balance(&first.message.static_account_keys()[0].to_string())
+            .expect("payer balance");
+        {
+            let (_sender, receiver) = unbounded_channel();
+            let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
+            let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+            database.set_block_outcomes(outcome_sender);
+            let result = database.handle_block(42, block.clone());
+            database.report_block(9, result);
+            assert!(matches!(
+                outcome_receiver.try_recv(),
+                Ok(ProtocolMessage::BlockProcessingResult(9, Ok(())))
+            ));
+            assert!(outcome_receiver.try_recv().is_err());
+            assert_eq!(
+                database
+                    .get_block(42)
+                    .expect("block")
+                    .get_account_balance(&first.message.static_account_keys()[0].to_string()),
+                Some(balance)
+            );
+        }
+        let (_sender, receiver) = unbounded_channel();
+        let database = RocksDb::initialize(path, receiver).expect("reopen");
+        assert!(database.get_block(42).is_some());
+        let (reply_sender, mut reply_receiver) = unbounded_channel();
+        database
+            .handle_tx_request(first_signature, reply_sender.clone())
+            .expect("first signature");
+        database
+            .handle_tx_request(second_signature, reply_sender)
+            .expect("second signature");
+        assert!(matches!(
+            reply_receiver.try_recv(),
+            Ok(ProtocolMessage::TxDetails(_))
+        ));
+        assert!(matches!(
+            reply_receiver.try_recv(),
+            Ok(ProtocolMessage::TxDetails(_))
+        ));
+    }
+
+    #[test]
+    fn repeated_block_is_idempotent_and_a_conflict_writes_nothing() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = unbounded_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        let mut block = crate::util::Block::default();
+        block.push_transaction(
+            solana_sdk::signature::Signature::from([7; 64]),
+            crate::util::TxRecord::default(),
+        );
+        block.insert_account("payer".to_string(), 42);
+        database
+            .handle_block(3, block.clone())
+            .expect("first write");
+        let stored = database.get_block(3);
+        database.handle_block(3, block).expect("identical repeat");
+        assert_eq!(database.get_block(3), stored);
+        let mut changed = crate::util::Block::default();
+        changed.push_transaction(
+            solana_sdk::signature::Signature::from([8; 64]),
+            crate::util::TxRecord::default(),
+        );
+        let conflict = database.handle_block(3, changed);
+        assert!(matches!(conflict, Err(AggError::ConflictingBlock)));
+        assert_eq!(database.get_block(3), stored);
+    }
+
+    #[test]
+    fn serialization_failure_leaves_the_database_unchanged() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = unbounded_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        database.inject_serialization_failure();
+        let error = database
+            .handle_block(1, crate::util::Block::default())
+            .expect_err("serialization");
+        assert!(matches!(error, AggError::JsonError(_)));
+        assert!(database.get_block(1).is_none());
+        assert!(database.get_latest_block().is_none());
+    }
+
+    #[test]
+    fn fresh_database_records_its_storage_format() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = unbounded_channel();
+        let database = RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+            .expect("open");
+        let marker = database
+            .db
+            .get(super::STORAGE_FORMAT_KEY)
+            .expect("read marker")
+            .expect("marker");
+        assert_eq!(marker, super::STORAGE_FORMAT_VERSION.as_bytes());
+    }
+
+    #[test]
+    fn unversioned_database_is_not_migrated() {
+        let directory = TempDir::new();
+        {
+            let db = rocksdb::DB::open_default(&directory.path).expect("raw database");
+            db.put(super::LATEST_BLOCK_NO_KEY, b"1")
+                .expect("legacy key");
+        }
+        let (_sender, receiver) = unbounded_channel();
+        let error =
+            match RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver) {
+                Ok(_) => panic!("legacy database was opened"),
+                Err(error) => error,
+            };
+        let message = error.to_string();
+        assert!(message.contains("fresh database"), "{message}");
+        assert!(message.contains("reindex"), "{message}");
+        let db = rocksdb::DB::open_default(&directory.path).expect("unchanged database");
+        assert!(db.get(super::LATEST_BLOCK_NO_KEY).unwrap().is_some());
+        assert!(db.get(super::STORAGE_FORMAT_KEY).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_block_persists_no_transaction_indexes() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = unbounded_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        database
+            .handle_block(1, crate::util::Block::default())
+            .expect("empty block");
+        assert!(database.get_block(1).is_some());
+        assert_eq!(database.get_latest_block(), Some(1));
+        assert_eq!(signature_key_count(&database), 0);
     }
 }
