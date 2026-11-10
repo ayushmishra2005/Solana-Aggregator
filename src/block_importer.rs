@@ -29,7 +29,7 @@ const MAX_GET_BLOCK_BACKOFF: Duration = Duration::from_secs(1);
 enum BlockFetch {
     Fetched(UiConfirmedBlock),
     Skipped(u64),
-    Failed(AggError),
+    Failed { error: AggError, retryable: bool },
 }
 
 #[derive(Debug)]
@@ -37,6 +37,7 @@ enum SlotProgress {
     CaughtUp,
     Advanced,
     Halted(String),
+    Retry { slot: u64, reason: String },
     SlotQueryFailed,
 }
 
@@ -308,7 +309,7 @@ impl Subscriber {
 
     pub async fn run_with_shutdown(
         &mut self,
-        shutdown: tokio::sync::watch::Receiver<bool>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), String> {
         log::info!(
             target: "subscriber",
@@ -343,7 +344,32 @@ impl Subscriber {
                         runtime.set_phase(crate::lifecycle::ServicePhase::Indexing);
                     }
                 }
-                SlotProgress::SlotQueryFailed => {}
+                SlotProgress::Retry { slot, reason } => {
+                    warn!(
+                        target: "subscriber",
+                        "getBlock for slot {slot} is still unavailable after {MAX_GET_BLOCK_ATTEMPTS} attempts; retrying the same slot without moving the checkpoint: {reason}"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(MAX_GET_BLOCK_BACKOFF) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                log::info!(target: "subscriber", "Subscriber stopped scheduling new slots");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                SlotProgress::SlotQueryFailed => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(MAX_GET_BLOCK_BACKOFF) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                log::info!(target: "subscriber", "Subscriber stopped scheduling new slots");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -410,8 +436,12 @@ impl Subscriber {
                     "Stopping slot progression at {slot} after block processing failed: {err}"
                 )),
             },
-            BlockFetch::Failed(err) => SlotProgress::Halted(format!(
-                "Stopping slot progression at {slot} after getBlock failed: {err:?}"
+            BlockFetch::Failed { error, retryable } if retryable => SlotProgress::Retry {
+                slot,
+                reason: error.to_string(),
+            },
+            BlockFetch::Failed { error, .. } => SlotProgress::Halted(format!(
+                "Stopping slot progression at {slot} after getBlock failed: {error:?}"
             )),
         }
     }
@@ -476,9 +506,12 @@ impl BlockFetcher {
                 )
                 .await
             }
-            _ => BlockFetch::Failed(AggError::ClientError(ClientError::from(
-                ClientErrorKind::Custom("block fetcher received an unexpected message".to_string()),
-            ))),
+            _ => BlockFetch::Failed {
+                error: AggError::ClientError(ClientError::from(ClientErrorKind::Custom(
+                    "block fetcher received an unexpected message".to_string(),
+                ))),
+                retryable: false,
+            },
         }
     }
 
@@ -553,7 +586,11 @@ impl BlockFetcher {
                     pause(delay).await;
                 }
                 Err(err) => {
-                    let outcome = BlockFetch::Failed(AggError::from(err));
+                    let retryable = Self::is_transport_retry(&err);
+                    let outcome = BlockFetch::Failed {
+                        error: AggError::from(err),
+                        retryable,
+                    };
                     Self::dispatch_block_fetch(
                         slot,
                         &outcome,
@@ -592,6 +629,14 @@ impl BlockFetcher {
                 *code == JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE
                     || *code == JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET
             }
+            _ => Self::is_transport_retry(err),
+        }
+    }
+
+    /// Timeouts, connection failures, and HTTP 429 are retried after the
+    /// three-attempt budget. A concrete "block not available" answer is not.
+    fn is_transport_retry(err: &ClientError) -> bool {
+        match err.kind() {
             ClientErrorKind::Reqwest(err) => Self::reqwest_is_transient(err),
             ClientErrorKind::Io(err) => Self::io_is_transient(err),
             _ => false,
@@ -728,11 +773,17 @@ impl BlockFetcher {
             BlockFetch::Skipped(slot) => {
                 warn!(target: "subscriber", "Slot {slot} was skipped");
             }
-            BlockFetch::Failed(err) => {
+            BlockFetch::Failed { error, retryable } => {
                 error!(
                     target: "subscriber",
-                    "Failed to fetch block at slot {fetch_slot} after retry exhaustion: {err:?}"
+                    "Failed to fetch block at slot {fetch_slot} after retry exhaustion: {error:?}"
                 );
+                if *retryable {
+                    warn!(
+                        target: "subscriber",
+                        "Slot {fetch_slot} stays uncheckpointed and will be retried"
+                    );
+                }
             }
         }
     }
@@ -1251,7 +1302,7 @@ mod tests {
                 responses.push(Err(rpc_failure(code, format!("transient {code}"))));
             }
             let mut trial = block_on(fetch_responses(100, responses));
-            assert!(matches!(trial.outcome, BlockFetch::Failed(_)));
+            assert!(matches!(trial.outcome, BlockFetch::Failed { .. }));
             assert_finalized_attempts(&trial.calls, 100, 3);
             assert_eq!(
                 trial.delays,
@@ -1267,7 +1318,7 @@ mod tests {
                 "Slot 100 was skipped, or missing in long-term storage".to_string(),
             )),
         ));
-        assert!(matches!(trial.outcome, BlockFetch::Failed(_)));
+        assert!(matches!(trial.outcome, BlockFetch::Failed { .. }));
         assert!(trial.delays.is_empty());
         assert_finalized_get_block(&trial.calls, 100);
         assert!(trial.receiver.try_recv().is_err());
@@ -1279,7 +1330,7 @@ mod tests {
             100,
             Err(rpc_failure(-32602, "Invalid params".to_string())),
         ));
-        assert!(matches!(trial.outcome, BlockFetch::Failed(_)));
+        assert!(matches!(trial.outcome, BlockFetch::Failed { .. }));
         assert!(trial.delays.is_empty());
         assert_finalized_get_block(&trial.calls, 100);
         assert!(trial.receiver.try_recv().is_err());
@@ -1316,7 +1367,7 @@ mod tests {
 
     fn assert_failed_without_block_or_secret(outcome: BlockFetch, logged: &str) {
         match outcome {
-            BlockFetch::Failed(err) => {
+            BlockFetch::Failed { error: err, .. } => {
                 let rendered = format!("{err:?}");
                 assert!(!rendered.contains(RPC_SECRET), "{rendered}");
                 assert!(!rendered.contains("api-key="), "{rendered}");
@@ -1610,7 +1661,7 @@ mod tests {
             100,
             transports.into_iter().map(Err).collect(),
         ));
-        assert!(matches!(exhausted.outcome, BlockFetch::Failed(_)));
+        assert!(matches!(exhausted.outcome, BlockFetch::Failed { .. }));
         assert_finalized_attempts(&exhausted.calls, 100, 3);
         assert_eq!(
             exhausted.delays,
@@ -1875,6 +1926,45 @@ mod tests {
     }
 
     #[test]
+    fn transport_timeout_retries_the_same_slot_without_advancing() {
+        fn timed_out() -> solana_client::client_error::ClientError {
+            solana_client::client_error::ClientError::from(
+                solana_client::client_error::ClientErrorKind::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out",
+                )),
+            )
+        }
+        block_on(async {
+            let (mut subscriber, calls, _receiver) = progression_subscriber(
+                50,
+                80,
+                vec![
+                    Err(timed_out()),
+                    Err(timed_out()),
+                    Err(timed_out()),
+                    Err(timed_out()),
+                    Err(timed_out()),
+                    Err(timed_out()),
+                ],
+            );
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Retry { slot: 51, .. }
+            ));
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Retry { slot: 51, .. }
+            ));
+            assert_eq!(subscriber.latest_slot, 50);
+            assert_eq!(
+                block_requests(&calls.lock().expect("calls")),
+                vec![51, 51, 51, 51, 51, 51]
+            );
+        });
+    }
+
+    #[test]
     fn subscriber_does_not_fetch_when_the_cursor_is_caught_up() {
         let (mut subscriber, calls, mut receiver) = progression_subscriber(40, 40, Vec::new());
         let progress = block_on(subscriber.advance_once());
@@ -1909,7 +1999,7 @@ mod tests {
                     &jobs,
                 )
                 .await;
-                assert!(matches!(outcome, BlockFetch::Failed(_)));
+                assert!(matches!(outcome, BlockFetch::Failed { .. }));
             }
             assert_eq!(block_requests(&calls.lock().expect("calls")), vec![7, 7]);
         });

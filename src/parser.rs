@@ -25,12 +25,8 @@ struct DecodedTransfer {
 
 impl DecodedTransfer {
     fn instruction(&self) -> Instruction {
-        Instruction::transfer(self.from, self.to, sol_amount(self.lamports))
+        Instruction::transfer_exact(self.from, self.to, self.lamports)
     }
-}
-
-fn sol_amount(lamports: u64) -> f64 {
-    lamports as f64 / 1_000_000_000.0
 }
 
 pub struct Parser;
@@ -48,7 +44,7 @@ impl Parser {
     pub async fn invoke(message: ProtocolMessage) -> Result<(), AggError> {
         if let ProtocolMessage::NewChuck(block_no, chunk_no, total_chunks, txs, sender) = message {
             let mut partial_block = Block::default();
-            for (_, tx) in txs.iter().enumerate() {
+            for tx in txs.iter() {
                 let mut instructions = vec![];
                 let Some(transaction) = tx.transaction.decode() else {
                     return Err(AggError::InvalidTransactionSignature);
@@ -60,7 +56,7 @@ impl Parser {
                 let meta = tx.meta.as_ref();
                 let execution_failed = meta.and_then(|meta| meta.err.as_ref()).is_some();
                 if !execution_failed {
-                    for (_, instruction) in message.instructions().iter().enumerate() {
+                    for instruction in message.instructions().iter() {
                         if Self::is_transfer_instruction(message, instruction, meta)? {
                             instructions.push(
                                 Self::decode_transfer_instruction(message, instruction, meta)?
@@ -128,12 +124,7 @@ impl Parser {
         )
         .map_err(Self::lookup_error)?;
 
-        debug!(
-            "Transfer: {} SOL from {} to {}",
-            sol_amount(lamports),
-            from.to_string(),
-            to.to_string()
-        );
+        debug!("Transfer: {lamports} lamports from {from} to {to}");
         Ok(DecodedTransfer { from, to, lamports })
     }
 
@@ -382,7 +373,7 @@ mod tests {
         assert!(Parser::is_transfer_instruction(&message, &instruction, None).unwrap());
         let decoded = Parser::decode_transfer_instruction(&message, &instruction, None).unwrap();
         assert_eq!(decoded.lamports, LAMPORTS);
-        let expected = Instruction::transfer(from, to, LAMPORTS as f64 / 1_000_000_000.0);
+        let expected = Instruction::transfer_exact(from, to, LAMPORTS);
         assert_eq!(
             serde_json::to_value(decoded.instruction()).unwrap(),
             serde_json::to_value(expected).unwrap()
@@ -473,7 +464,8 @@ mod tests {
                 "Transfer": [
                     from.to_string(),
                     to.to_string(),
-                    LAMPORTS as f64 / 1_000_000_000.0
+                    LAMPORTS as f64 / 1_000_000_000.0,
+                    LAMPORTS
                 ]
             })
         );
@@ -1168,10 +1160,10 @@ mod tests {
         let value = transfer_json(&block, &signature);
         assert_eq!(
             value["instruction"][0],
-            serde_json::to_value(Instruction::transfer(
+            serde_json::to_value(Instruction::transfer_exact(
                 static_keys[0],
                 static_keys[1],
-                lamports as f64 / 1_000_000_000.0
+                lamports
             ))
             .unwrap()
         );
@@ -1201,10 +1193,10 @@ mod tests {
         let value = transfer_json(&block, &versioned.signatures[0].to_string());
         assert_eq!(
             value["instruction"][0],
-            serde_json::to_value(Instruction::transfer(
+            serde_json::to_value(Instruction::transfer_exact(
                 source.pubkey(),
                 destination,
-                lamports as f64 / 1_000_000_000.0
+                lamports
             ))
             .unwrap()
         );
@@ -1233,10 +1225,10 @@ mod tests {
         let value = transfer_json(&block, &signature);
         assert_eq!(
             value["instruction"][0],
-            serde_json::to_value(Instruction::transfer(
+            serde_json::to_value(Instruction::transfer_exact(
                 source.pubkey(),
                 destination,
-                lamports as f64 / 1_000_000_000.0
+                lamports
             ))
             .unwrap()
         );
@@ -1360,12 +1352,21 @@ mod tests {
     fn assert_exact_lamports(lamports: u64) {
         let decoded = static_transfer(lamports);
         assert_eq!(decoded.lamports, lamports);
+        let value = serde_json::to_value(decoded.instruction()).unwrap();
+        let fields = value["Transfer"].as_array().expect("transfer array");
+        assert_eq!(fields.len(), 4);
+        assert_eq!(
+            fields[2].as_f64().unwrap(),
+            lamports as f64 / 1_000_000_000.0
+        );
+        assert_eq!(fields[3].as_u64().unwrap(), lamports);
         let legacy =
             Instruction::transfer(decoded.from, decoded.to, lamports as f64 / 1_000_000_000.0);
-        assert_eq!(
-            serde_json::to_string(&decoded.instruction()).unwrap(),
-            serde_json::to_string(&legacy).unwrap()
-        );
+        let legacy_fields = serde_json::to_value(legacy).unwrap()["Transfer"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(&fields[..3], legacy_fields.as_slice());
     }
 
     #[test]
@@ -1394,9 +1395,13 @@ mod tests {
         let above = static_transfer((1_u64 << 53) + 1);
         assert_eq!(below.lamports + 1, above.lamports);
         assert_ne!(below.lamports, above.lamports);
+        let below_json = serde_json::to_value(below.instruction()).unwrap();
+        let above_json = serde_json::to_value(above.instruction()).unwrap();
+        assert_eq!(below_json["Transfer"][2], above_json["Transfer"][2]);
+        assert_eq!(below_json["Transfer"][3].as_u64().unwrap(), 1_u64 << 53);
         assert_eq!(
-            serde_json::to_string(&below.instruction()).unwrap(),
-            serde_json::to_string(&above.instruction()).unwrap()
+            above_json["Transfer"][3].as_u64().unwrap(),
+            (1_u64 << 53) + 1
         );
     }
 
@@ -1412,10 +1417,18 @@ mod tests {
             Parser::decode_transfer_instruction(&message, &valid_transfer_instruction(), None)
                 .unwrap();
         assert_eq!(decoded.lamports, LAMPORTS);
+        assert_eq!(decoded.instruction().lamports(), Some(LAMPORTS));
         let legacy = Instruction::transfer(from, to, LAMPORTS as f64 / 1_000_000_000.0);
+        let exact = serde_json::to_value(decoded.instruction()).unwrap();
+        let legacy_json = serde_json::to_value(legacy).unwrap();
+        assert_eq!(exact["Transfer"][2], legacy_json["Transfer"][2]);
+        assert_eq!(exact["Transfer"][3].as_u64().unwrap(), LAMPORTS);
+        let stored: Instruction =
+            serde_json::from_str(r#"{"Transfer":["from","to",1.5]}"#).unwrap();
+        assert_eq!(stored.lamports(), None);
         assert_eq!(
-            serde_json::to_string(&decoded.instruction()).unwrap(),
-            serde_json::to_string(&legacy).unwrap()
+            serde_json::to_string(&stored).unwrap(),
+            r#"{"Transfer":["from","to",1.5]}"#
         );
     }
 
@@ -1579,10 +1592,10 @@ mod tests {
         let value = transfer_json(&block, &signature);
         assert_eq!(
             value["instruction"][0],
-            serde_json::to_value(Instruction::transfer(
+            serde_json::to_value(Instruction::transfer_exact(
                 source.pubkey(),
                 destination,
-                lamports as f64 / 1_000_000_000.0
+                lamports
             ))
             .unwrap()
         );

@@ -314,7 +314,7 @@ fn secret_param_len(input: &str, names: &[&str]) -> Option<usize> {
 }
 
 fn quoted_value_len(input: &str) -> Option<usize> {
-    let trimmed = input.trim_start_matches(|c: char| matches!(c, ' ' | '\n' | '\r' | '\t'));
+    let trimmed = input.trim_start_matches([' ', '\n', '\r', '\t']);
     let whitespace = input.len() - trimmed.len();
     if !trimmed.starts_with('"') {
         return None;

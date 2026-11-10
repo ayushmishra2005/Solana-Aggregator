@@ -52,27 +52,80 @@ fn install_stderr_logger() {
     log::set_max_level(log::LevelFilter::Info);
 }
 
+#[derive(Debug)]
+enum CheckpointPlan {
+    Resume(u64),
+    Establish(u64),
+}
+
+fn plan_checkpoint(
+    existing: Option<u64>,
+    has_indexed_records: bool,
+    observed_tip: u64,
+    start_slot: Option<u64>,
+) -> Result<CheckpointPlan, String> {
+    if let Some(start_slot) = start_slot {
+        if start_slot == 0 {
+            return Err(
+                "--start-slot must be at least 1 so the first fetched slot is defined".to_string(),
+            );
+        }
+    }
+    if let Some(checkpoint) = existing {
+        if let Some(start_slot) = start_slot {
+            let boundary = start_slot - 1;
+            if boundary != checkpoint {
+                return Err(format!(
+                    "last_processed_slot is already {checkpoint}. --start-slot {start_slot} was not applied and the checkpoint was not changed."
+                ));
+            }
+        }
+        return Ok(CheckpointPlan::Resume(checkpoint));
+    }
+    if has_indexed_records {
+        return Err("RocksDB has indexed blocks but no last_processed_slot checkpoint. Use a fresh database directory or reindex explicitly. Existing records were not overwritten.".to_string());
+    }
+    let boundary = match start_slot {
+        Some(start_slot) => start_slot - 1,
+        None => observed_tip,
+    };
+    Ok(CheckpointPlan::Establish(boundary))
+}
+
 fn resume_subscriber(
     subscriber: &mut block_importer::Subscriber,
     database: &mut db_handler::RocksDb,
+    start_slot: Option<u64>,
 ) -> Result<(), String> {
-    if let Some(checkpoint) = database.read_checkpoint()? {
-        subscriber.resume_from_checkpoint(checkpoint);
-        log::info!(
-            target: "subscriber",
-            "Loaded checkpoint slot {checkpoint}"
-        );
-        return Ok(());
+    let plan = plan_checkpoint(
+        database.read_checkpoint()?,
+        database.has_indexed_records()?,
+        subscriber.completed_slot(),
+        start_slot,
+    )?;
+    match plan {
+        CheckpointPlan::Resume(slot) => {
+            subscriber.resume_from_checkpoint(slot);
+            log::info!(
+                target: "subscriber",
+                "Loaded checkpoint slot {slot}"
+            );
+        }
+        CheckpointPlan::Establish(slot) => {
+            database.establish_initial_checkpoint(slot)?;
+            subscriber.resume_from_checkpoint(slot);
+            match start_slot {
+                Some(start_slot) => log::info!(
+                    target: "subscriber",
+                    "Initialized checkpoint slot {slot} so the first fetched slot is {start_slot}"
+                ),
+                None => log::info!(
+                    target: "subscriber",
+                    "Initialized checkpoint slot {slot}"
+                ),
+            }
+        }
     }
-    if database.has_indexed_records()? {
-        return Err("RocksDB has indexed blocks but no last_processed_slot checkpoint. Use a fresh database directory or reindex explicitly. Existing records were not overwritten.".to_string());
-    }
-    let slot = subscriber.completed_slot();
-    database.establish_initial_checkpoint(slot)?;
-    log::info!(
-        target: "subscriber",
-        "Initialized checkpoint slot {slot}"
-    );
     Ok(())
 }
 
@@ -136,7 +189,7 @@ async fn run_indexer(opt: Cli) -> Termination {
     };
     database.set_block_outcomes(block_outcome_sender);
     database.attach_runtime(Arc::clone(&lifecycle));
-    if let Err(error) = resume_subscriber(&mut subscriber, &mut database) {
+    if let Err(error) = resume_subscriber(&mut subscriber, &mut database, opt.start_slot) {
         error!(target: "subscriber", "Error restoring slot checkpoint {error}");
         return Termination::Failed(error);
     }
@@ -363,5 +416,43 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_checkpoint, CheckpointPlan};
+
+    #[test]
+    fn fresh_start_uses_the_observed_tip_unless_a_start_slot_is_set() {
+        assert!(matches!(
+            plan_checkpoint(None, false, 80, None).unwrap(),
+            CheckpointPlan::Establish(80)
+        ));
+        assert!(matches!(
+            plan_checkpoint(None, false, 80, Some(40)).unwrap(),
+            CheckpointPlan::Establish(39)
+        ));
+        assert!(plan_checkpoint(None, false, 80, Some(0))
+            .unwrap_err()
+            .contains("at least 1"));
+    }
+
+    #[test]
+    fn start_slot_does_not_replace_a_different_checkpoint() {
+        assert!(matches!(
+            plan_checkpoint(Some(39), false, 80, Some(40)).unwrap(),
+            CheckpointPlan::Resume(39)
+        ));
+        let error = plan_checkpoint(Some(10), false, 80, Some(40)).unwrap_err();
+        assert!(error.contains("already 10"), "{error}");
+        assert!(error.contains("was not applied"), "{error}");
+        assert!(matches!(
+            plan_checkpoint(Some(10), true, 80, None).unwrap(),
+            CheckpointPlan::Resume(10)
+        ));
+        assert!(plan_checkpoint(None, true, 80, Some(40))
+            .unwrap_err()
+            .contains("reindex"));
     }
 }

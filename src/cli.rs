@@ -22,6 +22,12 @@ pub struct Cli {
 
     #[structopt(short = "", long = "port-no", default_value = "9944")]
     pub port_no: String,
+
+    /// First slot to fetch on a fresh database. The stored checkpoint is this slot minus one.
+    /// Ignored only when it names the same boundary as an existing checkpoint; any other
+    /// existing checkpoint is left unchanged and startup fails.
+    #[structopt(long = "start-slot")]
+    pub start_slot: Option<u64>,
 }
 
 #[cfg(test)]
@@ -75,7 +81,11 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> Cli {
-        Cli::from_iter_safe(args).unwrap_or_else(|err| panic!("failed to parse {args:?}: {err}"))
+        parse_result(args).unwrap_or_else(|err| panic!("failed to parse {args:?}: {err}"))
+    }
+
+    fn parse_result(args: &[&str]) -> Result<Cli, structopt::clap::Error> {
+        Cli::from_iter_safe(args)
     }
 
     #[test]
@@ -135,6 +145,7 @@ mod tests {
             "/Users/krishnasingh/Workspace/Official/solana-agg/db"
         );
         assert_eq!(defaults.port_no, "9944");
+        assert_eq!(defaults.start_slot, None);
 
         let configured = parse(&[
             "solana-agg",
@@ -148,6 +159,10 @@ mod tests {
         assert_eq!(configured.chain_url, "https://flags.example");
         assert_eq!(configured.db_path, "/tmp/solana-agg-db");
         assert_eq!(configured.port_no, "9999");
+
+        let started = parse(&["solana-agg", "--start-slot", "520762040"]);
+        assert_eq!(started.start_slot, Some(520762040));
+        assert!(parse_result(&["solana-agg", "--start-slot", "nope"]).is_err());
 
         let long_db = parse(&["solana-agg", "--db-url", "/var/tmp/solana-agg"]);
         assert_eq!(long_db.db_path, "/var/tmp/solana-agg");

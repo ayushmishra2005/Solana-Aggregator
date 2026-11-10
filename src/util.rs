@@ -1,3 +1,4 @@
+use serde::ser::SerializeTupleVariant;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_pubkey::Pubkey;
@@ -96,14 +97,130 @@ impl ProtocolMessage {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Instruction {
-    Transfer(String, String, f64),
+    /// `sol` is the historical floating-point SOL amount. `lamports` is the exact
+    /// amount when this process decoded the instruction. Records written before
+    /// that field existed deserialize with `lamports: None`.
+    Transfer {
+        from: String,
+        to: String,
+        sol: f64,
+        lamports: Option<u64>,
+    },
+}
+
+impl PartialEq for Instruction {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Transfer {
+                    from: left_from,
+                    to: left_to,
+                    sol: left_sol,
+                    lamports: left_lamports,
+                },
+                Self::Transfer {
+                    from: right_from,
+                    to: right_to,
+                    sol: right_sol,
+                    lamports: right_lamports,
+                },
+            ) => {
+                left_from == right_from
+                    && left_to == right_to
+                    && match (left_lamports, right_lamports) {
+                        (Some(left), Some(right)) => left == right,
+                        _ => left_sol == right_sol,
+                    }
+            }
+        }
+    }
 }
 
 impl Instruction {
+    /// Legacy constructor. The SOL amount is not an exact lamport quantity.
+    #[cfg(test)]
     pub fn transfer(from: Pubkey, to: Pubkey, amount: f64) -> Self {
-        Instruction::Transfer(from.to_string(), to.to_string(), amount)
+        Self::Transfer {
+            from: from.to_string(),
+            to: to.to_string(),
+            sol: amount,
+            lamports: None,
+        }
+    }
+
+    pub fn transfer_exact(from: Pubkey, to: Pubkey, lamports: u64) -> Self {
+        Self::Transfer {
+            from: from.to_string(),
+            to: to.to_string(),
+            sol: lamports as f64 / 1_000_000_000.0,
+            lamports: Some(lamports),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn lamports(&self) -> Option<u64> {
+        match self {
+            Self::Transfer { lamports, .. } => *lamports,
+        }
+    }
+}
+
+impl Serialize for Instruction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Self::Transfer {
+            from,
+            to,
+            sol,
+            lamports,
+        } = self;
+        let width = if lamports.is_some() { 4 } else { 3 };
+        let mut tuple = serializer.serialize_tuple_variant("Instruction", 0, "Transfer", width)?;
+        tuple.serialize_field(from)?;
+        tuple.serialize_field(to)?;
+        tuple.serialize_field(sol)?;
+        if let Some(lamports) = lamports {
+            tuple.serialize_field(lamports)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Instruction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Body {
+            Exact(String, String, f64, u64),
+            Legacy(String, String, f64),
+        }
+
+        #[derive(Deserialize)]
+        enum Wire {
+            Transfer(Body),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Transfer(Body::Exact(from, to, sol, lamports)) => Ok(Self::Transfer {
+                from,
+                to,
+                sol,
+                lamports: Some(lamports),
+            }),
+            Wire::Transfer(Body::Legacy(from, to, sol)) => Ok(Self::Transfer {
+                from,
+                to,
+                sol,
+                lamports: None,
+            }),
+        }
     }
 }
 
@@ -223,7 +340,7 @@ impl UnprocessedBlock {
 
     pub fn complete_the_block(&self) -> Block {
         let mut block = Block::default();
-        for (_, partial_block) in self.collected_partial_blocks.iter() {
+        for partial_block in self.collected_partial_blocks.values() {
             block.tx_map.extend(partial_block.tx_map.clone());
             if let Some(account_map) = &partial_block.account_map {
                 for (account, balance) in account_map.iter() {
