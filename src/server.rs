@@ -1,4 +1,5 @@
 use crate::error::AggError;
+use crate::lifecycle::{HealthBody, Lifecycle, StatusBody};
 use crate::util::{
     Channel, ProtocolMessage, QueryFailureKind, QueryParams, MAX_API_BLOCK_RANGE,
     REPLY_CHANNEL_CAPACITY,
@@ -9,8 +10,10 @@ use serde::Serialize;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -18,19 +21,34 @@ const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct ApiState {
     sender: Sender<ProtocolMessage>,
     db_timeout: Duration,
+    lifecycle: Option<Arc<Lifecycle>>,
 }
 
 impl ApiState {
-    fn production(sender: Sender<ProtocolMessage>) -> Self {
+    fn production(sender: Sender<ProtocolMessage>, lifecycle: Arc<Lifecycle>) -> Self {
         Self {
             sender,
             db_timeout: DATABASE_TIMEOUT,
+            lifecycle: Some(lifecycle),
         }
     }
 
     #[cfg(test)]
     fn with_timeout(sender: Sender<ProtocolMessage>, db_timeout: Duration) -> Self {
-        Self { sender, db_timeout }
+        Self {
+            sender,
+            db_timeout,
+            lifecycle: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lifecycle(sender: Sender<ProtocolMessage>, lifecycle: Arc<Lifecycle>) -> Self {
+        Self {
+            sender,
+            db_timeout: DATABASE_TIMEOUT,
+            lifecycle: Some(lifecycle),
+        }
     }
 }
 
@@ -51,18 +69,57 @@ impl AggServer {
     pub async fn run(
         handler_sender: Sender<ProtocolMessage>,
         port_no: String,
+        lifecycle: Arc<Lifecycle>,
+        mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), AggError> {
-        let state = ApiState::production(handler_sender);
-        HttpServer::new(move || {
+        let state = ApiState::production(handler_sender, lifecycle);
+        let server = HttpServer::new(move || {
             App::new()
                 .app_data(web::Data::new(state.clone()))
                 .wrap(middleware::Logger::default())
                 .configure(configure)
         })
+        .disable_signals()
         .bind(format!("127.0.0.1:{port_no}"))?
-        .run()
-        .await?;
+        .shutdown_timeout(5)
+        .run();
+        let handle = server.handle();
+        // The server has to keep running on its own task. stop() waits for that
+        // task to observe the command, so it cannot be driven by the same future.
+        let mut server_task = AbortOnDrop(Some(tokio::spawn(server)));
+        tokio::select! {
+            result = server_task.0.as_mut().unwrap() => {
+                server_stopped(result)?;
+            }
+            _ = shutdown.wait_for(|stopped| *stopped) => {
+                log::info!(target: "server", "HTTP server stopping");
+                handle.stop(false).await;
+                let task = server_task.0.take().expect("HTTP server task");
+                server_stopped(task.await)?;
+                log::info!(target: "server", "HTTP server stopped");
+            }
+        }
         Ok(())
+    }
+}
+
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+fn server_stopped(
+    result: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
+) -> Result<(), AggError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(std::io::Error::other("HTTP server task stopped unexpectedly").into()),
     }
 }
 
@@ -72,7 +129,36 @@ pub(crate) fn configure(config: &mut web::ServiceConfig) {
         .service(get_block_details)
         .service(get_latest_block)
         .service(get_block_range)
-        .service(get_account_balance);
+        .service(get_account_balance)
+        .service(get_health)
+        .service(get_status);
+}
+
+#[get("/health")]
+async fn get_health(state: web::Data<ApiState>) -> impl Responder {
+    match state.lifecycle.as_ref() {
+        Some(lifecycle) if lifecycle.is_healthy() => {
+            HttpResponse::Ok().json(HealthBody { status: "healthy" })
+        }
+        _ => HttpResponse::ServiceUnavailable().json(HealthBody {
+            status: "unhealthy",
+        }),
+    }
+}
+
+#[get("/status")]
+async fn get_status(state: web::Data<ApiState>) -> impl Responder {
+    let Some(lifecycle) = &state.lifecycle else {
+        return HttpResponse::ServiceUnavailable().json(StatusBody {
+            state: "failed",
+            last_processed_slot: None,
+            last_indexed_block_height: None,
+            last_observed_finalized_slot: None,
+            last_successful_processing_time: None,
+            error: Some("Indexer status is unavailable".to_string()),
+        });
+    };
+    HttpResponse::Ok().json(StatusBody::from(lifecycle.snapshot()))
 }
 
 #[derive(Serialize)]
@@ -622,5 +708,106 @@ mod tests {
         assert!(!rendered.contains("not-json"), "{rendered}");
         db_task.abort();
         handler_task.abort();
+    }
+
+    async fn call_state(state: ApiState, uri: &str) -> (u16, Value) {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        let status = response.status().as_u16();
+        let body = test::read_body_json(response).await;
+        (status, body)
+    }
+
+    #[actix_web::test]
+    async fn health_is_ok_while_indexing_and_unavailable_when_a_worker_fails() {
+        let (lifecycle, _shutdown) = crate::lifecycle::Lifecycle::new();
+        lifecycle.set_phase(crate::lifecycle::ServicePhase::Indexing);
+        let (sender, _receiver) = crate::util::test_channel();
+        let (status, body) = call_state(
+            ApiState::with_lifecycle(sender.clone(), std::sync::Arc::clone(&lifecycle)),
+            "/health",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, serde_json::json!({"status": "healthy"}));
+
+        lifecycle.set_phase(crate::lifecycle::ServicePhase::CaughtUp);
+        let (status, body) = call_state(
+            ApiState::with_lifecycle(sender.clone(), std::sync::Arc::clone(&lifecycle)),
+            "/health",
+        )
+        .await;
+        assert_eq!((status, body["status"].as_str()), (200, Some("healthy")));
+
+        lifecycle.begin_shutdown();
+        let (status, body) = call_state(
+            ApiState::with_lifecycle(sender.clone(), std::sync::Arc::clone(&lifecycle)),
+            "/health",
+        )
+        .await;
+        assert_eq!(status, 503);
+        assert_eq!(body["status"], "unhealthy");
+
+        let (failed, _shutdown) = crate::lifecycle::Lifecycle::new();
+        failed.fail("handler stopped unexpectedly".to_string());
+        let (status, body) = call_state(ApiState::with_lifecycle(sender, failed), "/health").await;
+        assert_eq!(status, 503);
+        assert_eq!(body["status"], "unhealthy");
+    }
+
+    #[actix_web::test]
+    async fn status_reports_the_durable_slot_without_inventing_a_block_or_leaking_secrets() {
+        let (lifecycle, _shutdown) = crate::lifecycle::Lifecycle::new();
+        lifecycle.note_checkpoint(80);
+        let (sender, _receiver) = crate::util::test_channel();
+        let (_status, fresh) = call_state(
+            ApiState::with_lifecycle(sender.clone(), std::sync::Arc::clone(&lifecycle)),
+            "/status",
+        )
+        .await;
+        assert_eq!(fresh["state"], "starting");
+        assert_eq!(fresh["last_processed_slot"], 80);
+        assert!(fresh["last_indexed_block_height"].is_null());
+        assert!(fresh["error"].is_null());
+
+        lifecycle.set_phase(crate::lifecycle::ServicePhase::Indexing);
+        lifecycle.note_checkpoint(11);
+        lifecycle.note_block_height(4);
+        lifecycle.note_finalized_tip(20);
+        let (_status, indexed) = call_state(
+            ApiState::with_lifecycle(sender.clone(), std::sync::Arc::clone(&lifecycle)),
+            "/status",
+        )
+        .await;
+        assert_eq!(indexed["state"], "indexing");
+        assert_eq!(indexed["last_processed_slot"], 11);
+        assert_eq!(indexed["last_indexed_block_height"], 4);
+        assert_eq!(indexed["last_observed_finalized_slot"], 20);
+        assert_ne!(
+            indexed["last_processed_slot"],
+            indexed["last_indexed_block_height"]
+        );
+
+        let (skipped, _shutdown) = crate::lifecycle::Lifecycle::new();
+        skipped.note_checkpoint(12);
+        skipped.set_phase(crate::lifecycle::ServicePhase::Indexing);
+        let (_status, body) = call_state(
+            ApiState::with_lifecycle(sender, std::sync::Arc::clone(&skipped)),
+            "/status",
+        )
+        .await;
+        assert_eq!(body["last_processed_slot"], 12);
+        assert!(body["last_indexed_block_height"].is_null());
+        let rendered = body.to_string();
+        assert!(!rendered.contains("api-key"));
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("/tmp"));
+        assert!(!rendered.contains("RocksDB"));
     }
 }

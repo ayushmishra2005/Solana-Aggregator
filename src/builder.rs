@@ -188,8 +188,11 @@ impl<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver>
 }
 
 impl Builder<SourceChain, NoDbPath, NoDbSender, NoDbReceiver, HandlerSender, NoHandlerReceiver> {
-    pub async fn build(self) -> Result<Subscriber, AggError> {
-        Subscriber::initialize(self.chain_url.0, self.router_sender.0).await
+    pub async fn build(
+        self,
+        stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Subscriber, AggError> {
+        Subscriber::initialize(self.chain_url.0, self.router_sender.0, stopping).await
     }
 }
 

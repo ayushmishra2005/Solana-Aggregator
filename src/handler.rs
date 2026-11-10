@@ -56,66 +56,68 @@ impl Handler {
     /// This function runs the handler
     pub async fn run(&mut self) {
         loop {
-            if let Some(message) = self.message_receiver.recv().await {
-                match message {
-                    ProtocolMessage::ExpectBlock(fetch_slot, block_no, total_chunks) => {
-                        self.fetch_slots.insert(block_no, fetch_slot);
-                        self.note_expected_total(block_no, total_chunks);
-                    }
-                    ProtocolMessage::RecordSkippedSlot(fetch_slot) => {
-                        if self
-                            .db_sender
-                            .send(ProtocolMessage::RecordSkippedSlot(fetch_slot))
-                            .await
-                            .is_err()
-                        {
-                            self.report(fetch_slot, Err("database channel closed".to_string()));
-                        }
-                    }
-                    ProtocolMessage::StoreEmptyBlock(block_height, fetch_slot) => {
-                        if self
-                            .db_sender
-                            .send(ProtocolMessage::FinalizeBlock(
-                                block_height,
-                                Block::default(),
-                                fetch_slot,
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            self.report(fetch_slot, Err("database channel closed".to_string()));
-                        }
-                    }
-                    ProtocolMessage::ChunkFailed(block_no, fetch_slot, error) => {
-                        self.fail_block(block_no, fetch_slot, error);
-                    }
-                    ProtocolMessage::ParsedBlock(block_no, total_chunks, chunk_no, block) => {
-                        if let Err(err) =
-                            self.handle_unprocessed_block(block_no, total_chunks, chunk_no, block)
-                        {
-                            error!(target: "handler", "Error from handle_unprocessed_block {}", err);
-                        }
-                    }
-                    ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
-                        self.handle_tx_details(tx_id, server_sender).await;
-                    }
-                    ProtocolMessage::FetchBlockDetails(block_no, server_sender) => {
-                        self.handle_block_details(block_no, server_sender).await;
-                    }
-                    ProtocolMessage::FetchLatestBlock(server_sender) => {
-                        self.handle_latest_block_request(server_sender).await;
-                    }
-                    ProtocolMessage::FetchBlockRange(start, end, server_sender) => {
-                        self.handle_block_range_request(start, end, server_sender)
-                            .await;
-                    }
-                    ProtocolMessage::FetchAccountBalance(pubkey, block_no, server_sender) => {
-                        self.handle_account_balance(pubkey, block_no, server_sender)
-                            .await;
-                    }
-
-                    _ => {}
+            let Some(message) = self.message_receiver.recv().await else {
+                log::info!(target: "handler", "Handler stopped");
+                return;
+            };
+            match message {
+                ProtocolMessage::ExpectBlock(fetch_slot, block_no, total_chunks) => {
+                    self.fetch_slots.insert(block_no, fetch_slot);
+                    self.note_expected_total(block_no, total_chunks);
                 }
+                ProtocolMessage::RecordSkippedSlot(fetch_slot) => {
+                    if self
+                        .db_sender
+                        .send(ProtocolMessage::RecordSkippedSlot(fetch_slot))
+                        .await
+                        .is_err()
+                    {
+                        self.report(fetch_slot, Err("database channel closed".to_string()));
+                    }
+                }
+                ProtocolMessage::StoreEmptyBlock(block_height, fetch_slot) => {
+                    if self
+                        .db_sender
+                        .send(ProtocolMessage::FinalizeBlock(
+                            block_height,
+                            Block::default(),
+                            fetch_slot,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        self.report(fetch_slot, Err("database channel closed".to_string()));
+                    }
+                }
+                ProtocolMessage::ChunkFailed(block_no, fetch_slot, error) => {
+                    self.fail_block(block_no, fetch_slot, error);
+                }
+                ProtocolMessage::ParsedBlock(block_no, total_chunks, chunk_no, block) => {
+                    if let Err(err) =
+                        self.handle_unprocessed_block(block_no, total_chunks, chunk_no, block)
+                    {
+                        error!(target: "handler", "Error from handle_unprocessed_block {}", err);
+                    }
+                }
+                ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
+                    self.handle_tx_details(tx_id, server_sender).await;
+                }
+                ProtocolMessage::FetchBlockDetails(block_no, server_sender) => {
+                    self.handle_block_details(block_no, server_sender).await;
+                }
+                ProtocolMessage::FetchLatestBlock(server_sender) => {
+                    self.handle_latest_block_request(server_sender).await;
+                }
+                ProtocolMessage::FetchBlockRange(start, end, server_sender) => {
+                    self.handle_block_range_request(start, end, server_sender)
+                        .await;
+                }
+                ProtocolMessage::FetchAccountBalance(pubkey, block_no, server_sender) => {
+                    self.handle_account_balance(pubkey, block_no, server_sender)
+                        .await;
+                }
+
+                _ => {}
             }
         }
     }

@@ -249,6 +249,10 @@ impl<T> Channel<T> {
     pub fn sender(&self) -> Sender<T> {
         self.sender.clone()
     }
+
+    pub fn into_parts(self) -> (Sender<T>, Receiver<T>) {
+        (self.sender, self.receiver)
+    }
 }
 
 #[cfg(test)]

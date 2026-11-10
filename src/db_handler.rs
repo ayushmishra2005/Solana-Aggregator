@@ -54,6 +54,7 @@ pub struct RocksDb {
     temp_db: BTreeSet<u64>,
     fail_next_write: bool,
     fail_next_serialization: bool,
+    runtime: Option<std::sync::Arc<crate::lifecycle::Lifecycle>>,
 }
 
 impl RocksDb {
@@ -77,6 +78,7 @@ impl RocksDb {
             temp_db: Default::default(),
             fail_next_write: false,
             fail_next_serialization: false,
+            runtime: None,
         };
         database
             .ensure_storage_format(&path)
@@ -127,6 +129,18 @@ impl RocksDb {
         self.outcome_sender = Some(sender);
     }
 
+    pub fn attach_runtime(&mut self, runtime: std::sync::Arc<crate::lifecycle::Lifecycle>) {
+        self.runtime = Some(runtime);
+    }
+
+    pub(crate) fn indexed_block_height(&self) -> Result<Option<u64>, &'static str> {
+        match self.read_latest_height() {
+            Ok(height) => Ok(height),
+            Err(StoreFailure::Incompatible(_)) => Err("Corrupt latest block metadata"),
+            Err(_) => Err("Latest block metadata is unreadable"),
+        }
+    }
+
     #[cfg(test)]
     pub fn inject_write_failure(&mut self) {
         self.fail_next_write = true;
@@ -141,6 +155,7 @@ impl RocksDb {
     pub(crate) async fn run(mut self) {
         loop {
             let Some(message) = self.receiver.recv().await else {
+                log::info!(target: "db", "Database worker stopped");
                 return;
             };
             self = match tokio::task::spawn_blocking(move || {
@@ -419,7 +434,7 @@ impl RocksDb {
             ExistingBlock::Same | ExistingBlock::Absent => {}
         }
 
-        let mut latest = self.get_latest_block();
+        let mut latest = self.get_latest_block()?;
         let mut planned: BTreeMap<u64, Block> = BTreeMap::new();
         let mut buffered = BTreeSet::new();
         if Self::extends_latest(latest, block_no) {
@@ -466,7 +481,7 @@ impl RocksDb {
                 );
             }
         }
-        if self.get_latest_block() != latest {
+        if self.get_latest_block()? != latest {
             if let Some(latest_no) = latest {
                 batch.put(
                     LATEST_BLOCK_NO_KEY,
@@ -488,6 +503,11 @@ impl RocksDb {
             .write_opt(batch, &Self::durable_write_options())
             .map_err(StoreFailure::Database)
             .map_err(store_failure)?;
+        log::info!(
+            target: "db",
+            "Persisted block height {block_no} at slot {fetch_slot}"
+        );
+        self.publish_success(fetch_slot, true);
         for block_no in buffered {
             if planned.contains_key(&block_no) {
                 self.temp_db.insert(block_no);
@@ -524,7 +544,25 @@ impl RocksDb {
         self.db
             .write_opt(batch, &Self::durable_write_options())
             .map_err(StoreFailure::Database)?;
+        log::info!(
+            target: "db",
+            "Authoritative skipped slot {fetch_slot}; checkpoint advanced without a block"
+        );
+        self.publish_success(fetch_slot, false);
         Ok(())
+    }
+
+    fn publish_success(&self, fetch_slot: u64, update_height: bool) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        runtime.note_checkpoint(fetch_slot);
+        if update_height {
+            if let Ok(Some(height)) = self.read_latest_height() {
+                runtime.note_block_height(height);
+            }
+        }
+        runtime.note_success();
     }
 
     fn checkpoint_action(&self, fetch_slot: u64) -> Result<bool, StoreFailure> {
@@ -565,7 +603,7 @@ impl RocksDb {
     }
 
     fn restore_buffered_block_heights(&mut self) -> Result<(), StoreFailure> {
-        let Some(latest) = self.get_latest_block() else {
+        let Some(latest) = self.read_latest_height()? else {
             return Ok(());
         };
         for item in self.db.iterator(rocksdb::IteratorMode::Start) {
@@ -751,12 +789,25 @@ impl RocksDb {
     /// # Returns
     ///
     /// * `Option<u64>` - An Option that holds the block number
-    fn get_latest_block(&self) -> Option<u64> {
-        if let Ok(Some(block_no)) = self.db.get(LATEST_BLOCK_NO_KEY) {
-            Some(from_slice::<u64>(&block_no).unwrap())
-        } else {
-            None
+    fn read_latest_height(&self) -> Result<Option<u64>, StoreFailure> {
+        match self
+            .db
+            .get(LATEST_BLOCK_NO_KEY)
+            .map_err(StoreFailure::Database)?
+        {
+            None => Ok(None),
+            Some(bytes) => match from_slice::<u64>(&bytes) {
+                Ok(height) => Ok(Some(height)),
+                Err(_) => Err(StoreFailure::Incompatible(
+                    "Corrupt latest block metadata. Existing records were not overwritten."
+                        .to_string(),
+                )),
+            },
         }
+    }
+
+    fn get_latest_block(&self) -> Result<Option<u64>, AggError> {
+        self.read_latest_height().map_err(store_failure)
     }
 
     /// This function handles the error
@@ -1220,7 +1271,7 @@ mod tests {
             .expect_err("serialization");
         assert!(matches!(error, AggError::JsonError(_)));
         assert!(database.get_block(1).is_none());
-        assert!(database.get_latest_block().is_none());
+        assert!(database.get_latest_block().unwrap().is_none());
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(0));
     }
 
@@ -1274,7 +1325,7 @@ mod tests {
             .handle_block(1, crate::util::Block::default(), 1)
             .expect("empty block");
         assert!(database.get_block(1).is_some());
-        assert_eq!(database.get_latest_block(), Some(1));
+        assert_eq!(database.get_latest_block().unwrap(), Some(1));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(1));
         assert_eq!(signature_key_count(&database), 0);
     }
@@ -1335,7 +1386,7 @@ mod tests {
                 Ok(ProtocolMessage::BlockProcessingResult(5, Ok(())))
             ));
             assert!(database.get_block(5).is_none());
-            assert_eq!(database.get_latest_block(), None);
+            assert_eq!(database.get_latest_block().unwrap(), None);
             assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(5));
             database.inject_write_failure();
             let failed = database
@@ -1364,7 +1415,7 @@ mod tests {
         database
             .handle_block(100, crate::util::Block::default(), 8)
             .expect("persist");
-        assert_eq!(database.get_latest_block(), Some(100));
+        assert_eq!(database.get_latest_block().unwrap(), Some(100));
         assert_eq!(database.read_checkpoint().expect("slot"), Some(8));
     }
 
@@ -1477,7 +1528,7 @@ mod tests {
             database
                 .handle_block(3, crate::util::Block::default(), 2)
                 .expect("height 3");
-            assert_eq!(database.get_latest_block(), Some(1));
+            assert_eq!(database.get_latest_block().unwrap(), Some(1));
         }
         let (_sender, receiver) = crate::util::test_channel();
         let mut database = RocksDb::initialize(path, receiver).expect("reopen");
@@ -1488,7 +1539,7 @@ mod tests {
         database
             .handle_block(2, crate::util::Block::default(), 3)
             .expect("fill the height gap");
-        assert_eq!(database.get_latest_block(), Some(3));
+        assert_eq!(database.get_latest_block().unwrap(), Some(3));
         assert!(!database.temp_db.contains(&3));
         assert_eq!(database.read_checkpoint().expect("slot"), Some(3));
     }
@@ -1509,7 +1560,7 @@ mod tests {
         let mut database = RocksDb::initialize(path, receiver).expect("reopen");
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
         assert!(database.get_block(9).is_some());
-        assert_eq!(database.get_latest_block(), Some(9));
+        assert_eq!(database.get_latest_block().unwrap(), Some(9));
         let skipped = database.handle_block(10, crate::util::Block::default(), 6);
         assert!(matches!(skipped, Err(AggError::IncompatibleStorage(_))));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
@@ -1544,5 +1595,76 @@ mod tests {
             .get(super::LATEST_BLOCK_NO_KEY)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn corrupt_latest_block_metadata_is_a_controlled_error() {
+        let directory = TempDir::new();
+        let path = directory.path.to_string_lossy().to_string();
+        {
+            let (_sender, receiver) = crate::util::test_channel();
+            let database = RocksDb::initialize(path.clone(), receiver).expect("open");
+            database
+                .db
+                .put(super::LATEST_BLOCK_NO_KEY, b"not-json")
+                .expect("corrupt height");
+            let error = database.get_latest_block().expect_err("controlled error");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("Corrupt latest block metadata"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains(&path), "{rendered}");
+            assert!(!rendered.contains("not-json"), "{rendered}");
+        }
+        let (_sender, receiver) = crate::util::test_channel();
+        let Err(error) = RocksDb::initialize(path.clone(), receiver) else {
+            panic!("reopen refuses corrupt metadata");
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("Corrupt latest block metadata"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&path), "{rendered}");
+    }
+
+    #[test]
+    fn committed_block_survives_restart_and_a_failed_write_keeps_the_old_checkpoint() {
+        let directory = TempDir::new();
+        let path = directory.path.to_string_lossy().to_string();
+        let (lifecycle, _shutdown) = crate::lifecycle::Lifecycle::new();
+        {
+            let (_sender, receiver) = crate::util::test_channel();
+            let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
+            database.attach_runtime(std::sync::Arc::clone(&lifecycle));
+            database.establish_initial_checkpoint(10).expect("boundary");
+            assert_eq!(lifecycle.snapshot().last_indexed_block_height, None);
+            database
+                .handle_block(4, crate::util::Block::default(), 11)
+                .expect("persist");
+            let status = lifecycle.snapshot();
+            assert_eq!(status.last_processed_slot, Some(11));
+            assert_eq!(status.last_indexed_block_height, Some(4));
+            assert!(status.last_successful_processing_time.is_some());
+            database.record_skipped_slot(12).expect("skip");
+            let status = lifecycle.snapshot();
+            assert_eq!(status.last_processed_slot, Some(12));
+            assert_eq!(status.last_indexed_block_height, Some(4));
+            database.inject_write_failure();
+            let error = database
+                .handle_block(5, crate::util::Block::default(), 13)
+                .expect_err("write fails before the checkpoint moves");
+            assert!(matches!(error, AggError::WriteFailed));
+            assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(12));
+            assert_eq!(lifecycle.snapshot().last_processed_slot, Some(12));
+            assert!(database.get_block(5).is_none());
+        }
+        let (_sender, receiver) = crate::util::test_channel();
+        let database = RocksDb::initialize(path, receiver).expect("reopen");
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(12));
+        assert_eq!(database.get_latest_block().unwrap(), Some(4));
+        assert!(database.get_block(4).is_some());
+        assert!(database.get_block(5).is_none());
     }
 }
