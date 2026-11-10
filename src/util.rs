@@ -47,7 +47,8 @@ pub enum ProtocolMessage {
         Sender<Self>,
     ),
     ParsedBlock(SlotNo, TotalChunk, ChunkNo, Block),
-    FinalizeBlock(SlotNo, Block, SlotNo),
+    /// `block_height`, block, `fetch_slot`, `parent_slot`.
+    FinalizeBlock(SlotNo, Block, SlotNo, SlotNo),
     FetchTransactionDetails(String, Sender<Self>),
     TxDetails(TxRecord),
     FetchBlockDetails(String, Sender<Self>),
@@ -60,16 +61,17 @@ pub enum ProtocolMessage {
     AccountBalance(u64),
     /// Classified query failure. The text is a fixed client-safe message.
     QueryError(QueryFailureKind, &'static str),
-    /// `fetch_slot`, `block_height`, `total_chunks`.
-    ExpectBlock(SlotNo, SlotNo, TotalChunk),
+    /// `fetch_slot`, `block_height`, `total_chunks`, `parent_slot`.
+    ExpectBlock(SlotNo, SlotNo, TotalChunk, SlotNo),
     /// `block_height`, `fetch_slot`, sanitized error.
     ChunkFailed(SlotNo, SlotNo, String),
     /// `fetch_slot`, `Ok(())` only after the block is parsed and the writer accepts it.
     BlockProcessingResult(SlotNo, Result<(), String>),
     /// Durably checkpoint an authoritative skipped slot. No block is stored.
     RecordSkippedSlot(SlotNo),
-    /// `block_height`, `fetch_slot`. Persist an empty fetched block and its slot checkpoint.
-    StoreEmptyBlock(SlotNo, SlotNo),
+    /// `block_height`, `fetch_slot`, `parent_slot`.
+    /// Persist an empty fetched block and its slot checkpoint.
+    StoreEmptyBlock(SlotNo, SlotNo, SlotNo),
 }
 
 impl ProtocolMessage {
@@ -261,8 +263,18 @@ impl Block {
         self.tx_map.get(tx_hash)
     }
 
-    pub fn push_transaction(&mut self, signature: Signature, tx: TxRecord) {
-        self.tx_map.insert(signature.to_string(), tx);
+    /// Inserts a transaction. An identical signature is ignored. A different record
+    /// for the same canonical signature is rejected instead of overwriting.
+    pub fn push_transaction(&mut self, signature: Signature, tx: TxRecord) -> Result<(), ()> {
+        let key = signature.to_string();
+        if let Some(existing) = self.tx_map.get(&key) {
+            if existing != &tx {
+                return Err(());
+            }
+            return Ok(());
+        }
+        self.tx_map.insert(key, tx);
+        Ok(())
     }
 
     pub fn get_tx_hash(&self) -> Vec<String> {
@@ -338,17 +350,24 @@ impl UnprocessedBlock {
         Ok(true)
     }
 
-    pub fn complete_the_block(&self) -> Block {
+    pub fn complete_the_block(self) -> Result<Block, ()> {
         let mut block = Block::default();
-        for partial_block in self.collected_partial_blocks.values() {
-            block.tx_map.extend(partial_block.tx_map.clone());
-            if let Some(account_map) = &partial_block.account_map {
-                for (account, balance) in account_map.iter() {
-                    block.insert_account(account.clone(), *balance);
+        for partial_block in self.collected_partial_blocks.into_values() {
+            for signature in partial_block.tx_map.keys() {
+                if block.tx_map.contains_key(signature) {
+                    return Err(());
+                }
+            }
+            for (signature, tx) in partial_block.tx_map {
+                block.tx_map.insert(signature, tx);
+            }
+            if let Some(account_map) = partial_block.account_map {
+                for (account, balance) in account_map {
+                    block.insert_account(account, balance);
                 }
             }
         }
-        block
+        Ok(block)
     }
 }
 
@@ -395,7 +414,9 @@ mod tests {
 
     fn partial(chunk_no: u64, balance: u64) -> Block {
         let mut block = Block::default();
-        block.push_transaction(tx_signature(chunk_no), super::TxRecord::default());
+        block
+            .push_transaction(tx_signature(chunk_no), super::TxRecord::default())
+            .expect("transaction");
         block.insert_account(format!("chunk-{chunk_no}"), balance);
         block.insert_account("merged".to_string(), balance);
         block
@@ -423,7 +444,7 @@ mod tests {
     fn distinct_chunks_complete_block() {
         let (block, completed) = insert_sequence(2, &[(0, 1), (1, 2)]);
         assert_eq!(completed, vec![false, true]);
-        let merged = block.complete_the_block();
+        let merged = block.complete_the_block().expect("merge");
         assert!(merged
             .get_tx_details(&tx_signature(0).to_string())
             .is_some());
@@ -437,7 +458,7 @@ mod tests {
     fn out_of_order_chunks_merge_in_chunk_index_order() {
         let (block, completed) = insert_sequence(2, &[(1, 2), (0, 1)]);
         assert_eq!(completed, vec![false, true]);
-        let merged = block.complete_the_block();
+        let merged = block.complete_the_block().expect("merge");
         assert!(merged
             .get_tx_details(&tx_signature(0).to_string())
             .is_some());
@@ -453,7 +474,7 @@ mod tests {
     fn block_completes_only_after_missing_chunk_arrives() {
         let (block, completed) = insert_sequence(2, &[(0, 1), (0, 1), (1, 2)]);
         assert_eq!(completed, vec![false, false, true]);
-        let merged = block.complete_the_block();
+        let merged = block.complete_the_block().expect("merge");
         assert!(merged
             .get_tx_details(&tx_signature(0).to_string())
             .is_some());
@@ -472,7 +493,7 @@ mod tests {
     fn three_distinct_chunks_complete_block() {
         let (block, completed) = insert_sequence(3, &[(0, 1), (1, 2), (2, 3)]);
         assert_eq!(completed, vec![false, false, true]);
-        let merged = block.complete_the_block();
+        let merged = block.complete_the_block().expect("merge");
         assert_eq!(merged.get_account_balance("chunk-0"), Some(1));
         assert_eq!(merged.get_account_balance("chunk-1"), Some(2));
         assert_eq!(merged.get_account_balance("chunk-2"), Some(3));
@@ -489,9 +510,30 @@ mod tests {
         ));
         assert!(!block.is_complete());
         assert_eq!(
-            block.complete_the_block().get_account_balance("chunk-0"),
+            block
+                .complete_the_block()
+                .expect("merge")
+                .get_account_balance("chunk-0"),
             Some(1)
         );
+    }
+
+    #[test]
+    fn duplicate_signature_with_a_different_record_is_rejected() {
+        let mut block = Block::default();
+        let signature = tx_signature(4);
+        block
+            .push_transaction(signature, super::TxRecord::default())
+            .expect("first");
+        let other = super::TxRecord {
+            instruction: Vec::new(),
+            metadata: Some("different".to_string()),
+        };
+        assert!(block.push_transaction(signature, other).is_err());
+        assert!(block
+            .push_transaction(signature, super::TxRecord::default())
+            .is_ok());
+        assert_eq!(block.transaction_ids().count(), 1);
     }
 
     #[test]

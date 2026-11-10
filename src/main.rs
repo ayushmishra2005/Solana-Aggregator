@@ -96,7 +96,9 @@ fn resume_subscriber(
     subscriber: &mut block_importer::Subscriber,
     database: &mut db_handler::RocksDb,
     start_slot: Option<u64>,
+    genesis: &str,
 ) -> Result<(), String> {
+    let identity_matches = database.verify_chain_identity(genesis)?;
     let plan = plan_checkpoint(
         database.read_checkpoint()?,
         database.has_indexed_records()?,
@@ -105,6 +107,11 @@ fn resume_subscriber(
     )?;
     match plan {
         CheckpointPlan::Resume(slot) => {
+            if !identity_matches {
+                return Err(
+                    "Database checkpoint has no verified genesis identity. Existing records were not modified. Use a fresh database directory or reindex explicitly.".to_string(),
+                );
+            }
             subscriber.resume_from_checkpoint(slot);
             log::info!(
                 target: "subscriber",
@@ -112,7 +119,7 @@ fn resume_subscriber(
             );
         }
         CheckpointPlan::Establish(slot) => {
-            database.establish_initial_checkpoint(slot)?;
+            database.initialize_chain(slot, genesis)?;
             subscriber.resume_from_checkpoint(slot);
             match start_slot {
                 Some(start_slot) => log::info!(
@@ -189,7 +196,15 @@ async fn run_indexer(opt: Cli) -> Termination {
     };
     database.set_block_outcomes(block_outcome_sender);
     database.attach_runtime(Arc::clone(&lifecycle));
-    if let Err(error) = resume_subscriber(&mut subscriber, &mut database, opt.start_slot) {
+    let genesis = match subscriber.chain_genesis_hash().await {
+        Ok(genesis) => genesis,
+        Err(error) => {
+            error!(target: "subscriber", "Error reading RPC genesis hash {error}");
+            return Termination::Failed(format!("RPC genesis hash is unavailable: {error}"));
+        }
+    };
+    if let Err(error) = resume_subscriber(&mut subscriber, &mut database, opt.start_slot, &genesis)
+    {
         error!(target: "subscriber", "Error restoring slot checkpoint {error}");
         return Termination::Failed(error);
     }

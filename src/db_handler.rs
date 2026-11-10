@@ -7,6 +7,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 const LATEST_BLOCK_NO_KEY: &str = "lst_blk_no";
 const CHECKPOINT_KEY: &str = "last_processed_slot";
+const GENESIS_KEY: &str = "solana_genesis_hash";
+const LAST_PRODUCED_SLOT_KEY: &str = "last_produced_slot";
 const STORAGE_FORMAT_KEY: &str = "solana_agg_storage_format";
 const STORAGE_FORMAT_V1: &str = "canonical-signature-v1";
 const STORAGE_FORMAT_VERSION: &str = "canonical-signature-v2";
@@ -94,13 +96,19 @@ impl RocksDb {
         self.read_checkpoint_value().map_err(|err| err.to_string())
     }
 
-    /// Records the first-run slot boundary. Slots at or below it are not claimed as indexed.
+    /// Test helper. Production startup uses `initialize_chain` with the RPC genesis hash.
+    #[cfg(test)]
     pub fn establish_initial_checkpoint(&mut self, slot: u64) -> Result<(), String> {
-        self.write_initial_checkpoint(slot)
+        self.initialize_chain(slot, "solana-agg-test-genesis")
+    }
+
+    /// Writes the checkpoint, genesis hash, and storage marker in one synced batch.
+    pub fn initialize_chain(&mut self, slot: u64, genesis: &str) -> Result<(), String> {
+        self.write_initial_chain(slot, genesis)
             .map_err(|err| err.to_string())
     }
 
-    fn write_initial_checkpoint(&mut self, slot: u64) -> Result<(), StoreFailure> {
+    fn write_initial_chain(&mut self, slot: u64, genesis: &str) -> Result<(), StoreFailure> {
         if self.read_checkpoint_value()?.is_some() {
             return Err(StoreFailure::Incompatible(
                 "last_processed_slot is already initialized".to_string(),
@@ -111,12 +119,42 @@ impl RocksDb {
                 "RocksDB has indexed blocks but no last_processed_slot checkpoint. Use a fresh database directory or reindex explicitly. Existing records were not overwritten.".to_string(),
             ));
         }
+        if let Some(existing) = self.read_genesis_value()? {
+            if existing != genesis {
+                return Err(StoreFailure::Incompatible(
+                    "Database genesis hash does not match this RPC endpoint. The database was not modified.".to_string(),
+                ));
+            }
+        }
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(CHECKPOINT_KEY, to_vec(&slot).map_err(StoreFailure::Json)?);
+        batch.put(GENESIS_KEY, genesis.as_bytes());
+        batch.put(STORAGE_FORMAT_KEY, STORAGE_FORMAT_VERSION);
         self.db
             .write_opt(batch, &Self::durable_write_options())
             .map_err(StoreFailure::Database)?;
         Ok(())
+    }
+
+    fn read_genesis_value(&self) -> Result<Option<String>, StoreFailure> {
+        match self.db.get(GENESIS_KEY).map_err(StoreFailure::Database)? {
+            None => Ok(None),
+            Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+                StoreFailure::Incompatible(
+                    "Corrupt solana_genesis_hash value. Existing records were not rewritten."
+                        .to_string(),
+                )
+            }),
+        }
+    }
+
+    fn require_verified_genesis(&self) -> Result<(), AggError> {
+        match self.read_genesis_value().map_err(store_failure)? {
+            Some(_) => Ok(()),
+            None => Err(AggError::IncompatibleStorage(
+                "Database checkpoint has no verified genesis identity. Existing records were not modified. Use a fresh database directory or reindex explicitly.".to_string(),
+            )),
+        }
     }
 
     pub fn has_indexed_records(&self) -> Result<bool, String> {
@@ -174,13 +212,13 @@ impl RocksDb {
 
     fn handle_incoming(&mut self, message: ProtocolMessage) {
         match message {
-            ProtocolMessage::FinalizeBlock(block_no, block, fetch_slot) => {
+            ProtocolMessage::FinalizeBlock(block_no, block, fetch_slot, parent_slot) => {
                 println!(
                     "here block no {:?} {:?}",
                     block_no,
                     block.get_tx_hash().len()
                 );
-                let result = self.handle_block(block_no, block, fetch_slot);
+                let result = self.handle_block(block_no, block, fetch_slot, parent_slot);
                 if let Err(err) = &result {
                     error!(target: "db", "Error from handle_block {}", err);
                 }
@@ -341,7 +379,7 @@ impl RocksDb {
         if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
             let block = from_slice::<Block>(&block)?;
             server_sender
-                .try_send(ProtocolMessage::BlockDetails(block.clone()))
+                .try_send(ProtocolMessage::BlockDetails(block))
                 .map_err(|_| AggError::OneshotChannelError)?;
         } else {
             return Err(AggError::BlockNotFound);
@@ -374,7 +412,10 @@ impl RocksDb {
                     .try_send(ProtocolMessage::TxDetails(tx.clone()))
                     .map_err(|_| AggError::OneshotChannelError)?;
             } else {
-                return Err(AggError::BlockNotFound);
+                return Err(AggError::IncompatibleStorage(
+                    "Signature index points at a missing block. The index was not deleted."
+                        .to_string(),
+                ));
             }
         } else {
             return Err(AggError::TxNotFound);
@@ -410,6 +451,7 @@ impl RocksDb {
         block_no: u64,
         block: Block,
         fetch_slot: u64,
+        parent_slot: u64,
     ) -> Result<(), AggError> {
         if self.fail_next_write {
             self.fail_next_write = false;
@@ -424,6 +466,10 @@ impl RocksDb {
         self.reject_foreign_signature_indexes(block_no, &block)
             .map_err(store_failure)?;
         let advance_checkpoint = self.checkpoint_action(fetch_slot).map_err(store_failure)?;
+        if advance_checkpoint {
+            self.require_verified_genesis()?;
+            self.enforce_produced_continuity(block_no, fetch_slot, parent_slot)?;
+        }
         match self
             .existing_block_status(block_no, &block)
             .map_err(store_failure)?
@@ -441,8 +487,9 @@ impl RocksDb {
             latest = Some(block_no);
             planned.insert(block_no, snapshot);
         } else {
-            buffered.insert(block_no);
-            planned.insert(block_no, block);
+            return Err(AggError::IncompatibleStorage(format!(
+                "Refusing block height {block_no}; it does not continue the indexed block height. The checkpoint was not advanced."
+            )));
         }
         buffered.extend(self.temp_db.iter().copied());
         let mut promoted = Vec::new();
@@ -497,6 +544,12 @@ impl RocksDb {
                     .map_err(StoreFailure::Json)
                     .map_err(store_failure)?,
             );
+            batch.put(
+                LAST_PRODUCED_SLOT_KEY,
+                to_vec(&fetch_slot)
+                    .map_err(StoreFailure::Json)
+                    .map_err(store_failure)?,
+            );
         }
         self.db
             .write_opt(batch, &Self::durable_write_options())
@@ -535,6 +588,10 @@ impl RocksDb {
         if !self.checkpoint_action(fetch_slot)? {
             return Ok(());
         }
+        self.require_verified_genesis().map_err(|err| match err {
+            AggError::IncompatibleStorage(message) => StoreFailure::Incompatible(message),
+            other => StoreFailure::Incompatible(other.to_string()),
+        })?;
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(
             CHECKPOINT_KEY,
@@ -562,6 +619,67 @@ impl RocksDb {
             }
         }
         runtime.note_success();
+    }
+
+    fn enforce_produced_continuity(
+        &self,
+        block_no: u64,
+        fetch_slot: u64,
+        parent_slot: u64,
+    ) -> Result<(), AggError> {
+        if parent_slot >= fetch_slot {
+            return Err(AggError::IncompatibleStorage(format!(
+                "Refusing slot {fetch_slot}; parent slot {parent_slot} is not before the fetched slot. The checkpoint was not advanced."
+            )));
+        }
+        if let Some(latest) = self.get_latest_block()? {
+            if block_no != latest.saturating_add(1) {
+                return Err(AggError::IncompatibleStorage(format!(
+                    "Refusing block height {block_no}; latest indexed height is {latest}. The checkpoint was not advanced."
+                )));
+            }
+        }
+        if let Some(last_produced) = self.read_last_produced_slot().map_err(store_failure)? {
+            if parent_slot != last_produced {
+                return Err(AggError::IncompatibleStorage(format!(
+                    "Refusing produced block; parent slot {parent_slot} does not continue last produced slot {last_produced}. The checkpoint was not advanced."
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_last_produced_slot(&self) -> Result<Option<u64>, StoreFailure> {
+        match self
+            .db
+            .get(LAST_PRODUCED_SLOT_KEY)
+            .map_err(StoreFailure::Database)?
+        {
+            None => Ok(None),
+            Some(bytes) => match from_slice::<u64>(&bytes) {
+                Ok(slot) => Ok(Some(slot)),
+                Err(_) => Err(StoreFailure::Incompatible(
+                    "Corrupt last_produced_slot value. Existing records were not overwritten."
+                        .to_string(),
+                )),
+            },
+        }
+    }
+
+    /// `Ok(true)` when the stored genesis hash matches. `Ok(false)` when this
+    /// database has no marker; the marker is not created here.
+    pub fn verify_chain_identity(&self, genesis: &str) -> Result<bool, String> {
+        match self.read_genesis()? {
+            Some(existing) if existing != genesis => Err(
+                "Database genesis hash does not match this RPC endpoint. The database was not modified.".to_string(),
+            ),
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    pub fn read_genesis(&self) -> Result<Option<String>, String> {
+        self.read_genesis_value().map_err(|err| err.to_string())
     }
 
     fn checkpoint_action(&self, fetch_slot: u64) -> Result<bool, StoreFailure> {
@@ -594,6 +712,8 @@ impl RocksDb {
             let (key, _) = item.map_err(StoreFailure::Database)?;
             if key.as_ref() != STORAGE_FORMAT_KEY.as_bytes()
                 && key.as_ref() != CHECKPOINT_KEY.as_bytes()
+                && key.as_ref() != GENESIS_KEY.as_bytes()
+                && key.as_ref() != LAST_PRODUCED_SLOT_KEY.as_bytes()
             {
                 return Ok(true);
             }
@@ -751,9 +871,18 @@ impl RocksDb {
                 if let Some(accounts) = planned_block.get_account_map() {
                     account_map.clone_from(&accounts);
                 }
-            } else if let Some(stored) = self.read_stored_block(previous).map_err(store_failure)? {
-                if let Some(accounts) = stored.get_account_map() {
-                    account_map.clone_from(&accounts);
+            } else {
+                match self.read_stored_block(previous).map_err(store_failure)? {
+                    Some(stored) => {
+                        if let Some(accounts) = stored.get_account_map() {
+                            account_map.clone_from(&accounts);
+                        }
+                    }
+                    None => {
+                        return Err(AggError::IncompatibleStorage(
+                            "Missing predecessor block for the cumulative account snapshot. Existing observations were not replaced and the checkpoint was not advanced.".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -839,13 +968,31 @@ impl RocksDb {
     }
 
     #[cfg(test)]
+    pub(crate) fn persist_and_report(
+        &mut self,
+        block_no: u64,
+        fetch_slot: u64,
+        block: Block,
+    ) -> Result<(), AggError> {
+        let result = self.persist_test_block(block_no, fetch_slot, block);
+        let reported = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Some(sender) = &self.outcome_sender {
+            let _ = sender.try_send(ProtocolMessage::BlockProcessingResult(fetch_slot, reported));
+        }
+        result
+    }
+
+    #[cfg(test)]
     pub(crate) fn persist_test_block(
         &mut self,
         block_no: u64,
         fetch_slot: u64,
         block: Block,
     ) -> Result<(), AggError> {
-        self.handle_block(block_no, block, fetch_slot)
+        self.handle_block(block_no, block, fetch_slot, fetch_slot.saturating_sub(1))
     }
 
     #[cfg(test)]
@@ -1022,7 +1169,9 @@ mod tests {
         database
             .establish_initial_checkpoint(41)
             .expect("start boundary");
-        database.handle_block(42, block, 42).expect("persist block");
+        database
+            .handle_block(42, block, 42, 41)
+            .expect("persist block");
 
         let (reply_sender, mut reply_receiver) = crate::util::test_channel();
         database
@@ -1113,7 +1262,7 @@ mod tests {
         db.set_block_outcomes(outcome_sender);
         db.establish_initial_checkpoint(3).expect("start boundary");
         db.inject_write_failure();
-        let result = db.handle_block(4, crate::util::Block::default(), 4);
+        let result = db.handle_block(4, crate::util::Block::default(), 4, 3);
         db.report_block(15, result);
         match outcome_receiver.try_recv() {
             Ok(ProtocolMessage::BlockProcessingResult(15, Err(message))) => {
@@ -1134,12 +1283,14 @@ mod tests {
         let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
         db.set_block_outcomes(outcome_sender);
         let mut block = crate::util::Block::default();
-        block.push_transaction(
-            solana_signature::Signature::from([4; 64]),
-            crate::util::TxRecord::default(),
-        );
+        block
+            .push_transaction(
+                solana_signature::Signature::from([4; 64]),
+                crate::util::TxRecord::default(),
+            )
+            .expect("transaction");
         db.establish_initial_checkpoint(3).expect("start boundary");
-        let result = db.handle_block(4, block, 4);
+        let result = db.handle_block(4, block, 4, 3);
         db.report_block(15, result);
         assert!(matches!(
             outcome_receiver.try_recv(),
@@ -1165,6 +1316,8 @@ mod tests {
                 key != super::STORAGE_FORMAT_KEY
                     && key != super::LATEST_BLOCK_NO_KEY
                     && key != super::CHECKPOINT_KEY
+                    && key != super::GENESIS_KEY
+                    && key != super::LAST_PRODUCED_SLOT_KEY
                     && !key.starts_with("BlockNo")
             })
             .count()
@@ -1190,7 +1343,7 @@ mod tests {
             database
                 .establish_initial_checkpoint(8)
                 .expect("start boundary");
-            let result = database.handle_block(42, block.clone(), 9);
+            let result = database.handle_block(42, block.clone(), 9, 8);
             database.report_block(9, result);
             assert!(matches!(
                 outcome_receiver.try_recv(),
@@ -1234,28 +1387,32 @@ mod tests {
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
         let mut block = crate::util::Block::default();
-        block.push_transaction(
-            solana_signature::Signature::from([7; 64]),
-            crate::util::TxRecord::default(),
-        );
+        block
+            .push_transaction(
+                solana_signature::Signature::from([7; 64]),
+                crate::util::TxRecord::default(),
+            )
+            .expect("transaction");
         block.insert_account("payer".to_string(), 42);
         database
             .establish_initial_checkpoint(2)
             .expect("start boundary");
         database
-            .handle_block(3, block.clone(), 3)
+            .handle_block(3, block.clone(), 3, 2)
             .expect("first write");
         let stored = database.get_block(3).expect("read block");
         database
-            .handle_block(3, block, 3)
+            .handle_block(3, block, 3, 2)
             .expect("identical repeat");
         assert_eq!(database.get_block(3).expect("reread block"), stored);
         let mut changed = crate::util::Block::default();
-        changed.push_transaction(
-            solana_signature::Signature::from([8; 64]),
-            crate::util::TxRecord::default(),
-        );
-        let conflict = database.handle_block(3, changed, 3);
+        changed
+            .push_transaction(
+                solana_signature::Signature::from([8; 64]),
+                crate::util::TxRecord::default(),
+            )
+            .expect("transaction");
+        let conflict = database.handle_block(3, changed, 3, 2);
         assert!(matches!(conflict, Err(AggError::ConflictingBlock)));
         assert_eq!(database.get_block(3).expect("unchanged block"), stored);
     }
@@ -1272,7 +1429,7 @@ mod tests {
             .expect("start boundary");
         database.inject_serialization_failure();
         let error = database
-            .handle_block(1, crate::util::Block::default(), 1)
+            .handle_block(1, crate::util::Block::default(), 1, 0)
             .expect_err("serialization");
         assert!(matches!(error, AggError::JsonError(_)));
         assert!(database.get_block(1).unwrap().is_none());
@@ -1327,7 +1484,7 @@ mod tests {
             .establish_initial_checkpoint(0)
             .expect("start boundary");
         database
-            .handle_block(1, crate::util::Block::default(), 1)
+            .handle_block(1, crate::util::Block::default(), 1, 0)
             .expect("empty block");
         assert!(database.get_block(1).unwrap().is_some());
         assert_eq!(database.get_latest_block().unwrap(), Some(1));
@@ -1360,14 +1517,14 @@ mod tests {
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
         database.establish_initial_checkpoint(10).expect("boundary");
-        let gap = database.handle_block(1, crate::util::Block::default(), 12);
+        let gap = database.handle_block(1, crate::util::Block::default(), 12, 11);
         assert!(matches!(gap, Err(AggError::IncompatibleStorage(_))));
         assert!(database.get_block(1).unwrap().is_none());
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(10));
         database.record_skipped_slot(10).expect("already covered");
         database.record_skipped_slot(9).expect("older skip");
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(10));
-        let backwards = database.handle_block(2, crate::util::Block::default(), 8);
+        let backwards = database.handle_block(2, crate::util::Block::default(), 8, 7);
         assert!(matches!(backwards, Err(AggError::ConflictingBlock)));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(10));
     }
@@ -1418,7 +1575,7 @@ mod tests {
                 .expect("open");
         database.establish_initial_checkpoint(7).expect("boundary");
         database
-            .handle_block(100, crate::util::Block::default(), 8)
+            .handle_block(100, crate::util::Block::default(), 8, 7)
             .expect("persist");
         assert_eq!(database.get_latest_block().unwrap(), Some(100));
         assert_eq!(database.read_checkpoint().expect("slot"), Some(8));
@@ -1520,33 +1677,24 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_block_heights_are_restored_after_reopen() {
+    fn discontinuous_block_height_does_not_advance_the_checkpoint() {
         let directory = TempDir::new();
-        let path = directory.path.to_string_lossy().to_string();
-        {
-            let (_sender, receiver) = crate::util::test_channel();
-            let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
-            database.establish_initial_checkpoint(0).expect("boundary");
-            database
-                .handle_block(1, crate::util::Block::default(), 1)
-                .expect("height 1");
-            database
-                .handle_block(3, crate::util::Block::default(), 2)
-                .expect("height 3");
-            assert_eq!(database.get_latest_block().unwrap(), Some(1));
-        }
         let (_sender, receiver) = crate::util::test_channel();
-        let mut database = RocksDb::initialize(path, receiver).expect("reopen");
-        assert!(database.temp_db.contains(&3));
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        database.establish_initial_checkpoint(0).expect("boundary");
         database
-            .establish_initial_checkpoint(2)
-            .expect_err("checkpoint exists");
-        database
-            .handle_block(2, crate::util::Block::default(), 3)
-            .expect("fill the height gap");
-        assert_eq!(database.get_latest_block().unwrap(), Some(3));
+            .handle_block(1, crate::util::Block::default(), 1, 0)
+            .expect("height 1");
+        let gap = database
+            .handle_block(3, crate::util::Block::default(), 2, 1)
+            .expect_err("missing height 2");
+        assert!(matches!(gap, AggError::IncompatibleStorage(_)));
+        assert_eq!(database.get_latest_block().unwrap(), Some(1));
+        assert!(database.get_block(3).unwrap().is_none());
         assert!(!database.temp_db.contains(&3));
-        assert_eq!(database.read_checkpoint().expect("slot"), Some(3));
+        assert_eq!(database.read_checkpoint().expect("slot"), Some(1));
     }
 
     #[test]
@@ -1558,7 +1706,7 @@ mod tests {
             let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
             database.establish_initial_checkpoint(3).expect("boundary");
             database
-                .handle_block(9, crate::util::Block::default(), 4)
+                .handle_block(9, crate::util::Block::default(), 4, 3)
                 .expect("durable batch");
         }
         let (_sender, receiver) = crate::util::test_channel();
@@ -1566,7 +1714,7 @@ mod tests {
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
         assert!(database.get_block(9).unwrap().is_some());
         assert_eq!(database.get_latest_block().unwrap(), Some(9));
-        let skipped = database.handle_block(10, crate::util::Block::default(), 6);
+        let skipped = database.handle_block(10, crate::util::Block::default(), 6, 5);
         assert!(matches!(skipped, Err(AggError::IncompatibleStorage(_))));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
         assert!(database.get_block(10).unwrap().is_none());
@@ -1646,7 +1794,7 @@ mod tests {
             database.establish_initial_checkpoint(10).expect("boundary");
             assert_eq!(lifecycle.snapshot().last_indexed_block_height, None);
             database
-                .handle_block(4, crate::util::Block::default(), 11)
+                .handle_block(4, crate::util::Block::default(), 11, 10)
                 .expect("persist");
             let status = lifecycle.snapshot();
             assert_eq!(status.last_processed_slot, Some(11));
@@ -1658,7 +1806,7 @@ mod tests {
             assert_eq!(status.last_indexed_block_height, Some(4));
             database.inject_write_failure();
             let error = database
-                .handle_block(5, crate::util::Block::default(), 13)
+                .handle_block(5, crate::util::Block::default(), 13, 11)
                 .expect_err("write fails before the checkpoint moves");
             assert!(matches!(error, AggError::WriteFailed));
             assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(12));
@@ -1681,7 +1829,7 @@ mod tests {
         let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
         database.establish_initial_checkpoint(1).expect("boundary");
         database
-            .handle_block(2, crate::util::Block::default(), 2)
+            .handle_block(2, crate::util::Block::default(), 2, 1)
             .expect("persist");
         database.corrupt_block_record(2).expect("corrupt");
         assert!(database.get_block(99).expect("missing read").is_none());
@@ -1691,7 +1839,7 @@ mod tests {
         assert!(!rendered.contains(&path), "{rendered}");
         assert!(!rendered.contains("not-json"), "{rendered}");
         let rejected = database
-            .handle_block(3, crate::util::Block::default(), 3)
+            .handle_block(3, crate::util::Block::default(), 3, 2)
             .expect_err("do not acknowledge the next slot");
         assert!(matches!(rejected, AggError::IncompatibleStorage(_)));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(2));
@@ -1705,5 +1853,226 @@ mod tests {
                 .as_slice()
                 == b"not-json"
         );
+    }
+
+    #[test]
+    fn padded_system_transfer_is_parsed_and_persisted() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let lamports = 2_500_000_001_u64;
+        let mut instruction = system_instruction::transfer(&payer.pubkey(), &recipient, lamports);
+        instruction.data.push(0x5a);
+        assert!(instruction.data.len() > 12);
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&payer], Hash::new_from_array([7; 32]))
+            .expect("sign padded transfer");
+        let versioned = VersionedTransaction::from(transaction);
+        let signature = versioned.signatures[0].to_string();
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(status_meta(5_000, vec![1_000_000, lamports, 1])),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let block = parse_chunk(vec![encoded]);
+        let stored = serde_json::to_value(
+            block
+                .get_tx_details(&signature)
+                .expect("parsed padded transfer"),
+        )
+        .expect("json");
+        assert_eq!(
+            stored["instruction"][0]["Transfer"][3].as_u64(),
+            Some(lamports)
+        );
+        let directory = TempDir::new();
+        let path = directory.path.to_string_lossy().to_string();
+        {
+            let (_sender, receiver) = crate::util::test_channel();
+            let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
+            database.establish_initial_checkpoint(2).expect("boundary");
+            database
+                .handle_block(4, block, 3, 0)
+                .expect("persist padded transfer");
+        }
+        let (_sender, receiver) = crate::util::test_channel();
+        let database = RocksDb::initialize(path, receiver).expect("reopen");
+        let (reply_sender, mut reply_receiver) = crate::util::test_channel();
+        database
+            .handle_tx_request(signature, reply_sender)
+            .expect("stored signature");
+        match reply_receiver.try_recv().expect("reply") {
+            ProtocolMessage::TxDetails(record) => {
+                let value = serde_json::to_value(record).expect("stored json");
+                assert_eq!(
+                    value["instruction"][0]["Transfer"][3].as_u64(),
+                    Some(lamports)
+                );
+            }
+            other => panic!("expected the stored transfer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genesis_marker_rejects_a_different_cluster_and_keeps_records() {
+        let directory = TempDir::new();
+        let path = directory.path.to_string_lossy().to_string();
+        let genesis = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+        {
+            let (_sender, receiver) = crate::util::test_channel();
+            let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
+            database.initialize_chain(4, genesis).expect("atomic init");
+            assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
+            assert_eq!(
+                database.read_genesis().expect("marker").as_deref(),
+                Some(genesis)
+            );
+            database
+                .handle_block(1, crate::util::Block::default(), 5, 4)
+                .expect("block");
+        }
+        let (_sender, receiver) = crate::util::test_channel();
+        let database = RocksDb::initialize(path, receiver).expect("reopen");
+        assert!(database.verify_chain_identity(genesis).expect("same chain"));
+        let error = database
+            .verify_chain_identity("different-cluster-genesis")
+            .expect_err("wrong cluster");
+        assert!(error.contains("was not modified"), "{error}");
+        assert_eq!(
+            database.read_genesis().expect("marker").as_deref(),
+            Some(genesis)
+        );
+        assert!(database.get_block(1).unwrap().is_some());
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(5));
+    }
+
+    #[test]
+    fn checkpoint_without_genesis_is_not_writable() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = crate::util::test_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        database
+            .db
+            .put(
+                super::CHECKPOINT_KEY,
+                serde_json::to_vec(&4_u64).expect("slot"),
+            )
+            .expect("checkpoint only");
+        database
+            .db
+            .put(
+                "BlockNo1",
+                serde_json::to_vec(&crate::util::Block::default()).expect("block"),
+            )
+            .expect("existing block");
+        let rejected = database
+            .handle_block(2, crate::util::Block::default(), 5, 4)
+            .expect_err("unbound checkpoint");
+        assert!(matches!(rejected, AggError::IncompatibleStorage(_)));
+        assert!(rejected.to_string().contains("genesis"), "{rejected}");
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
+        assert!(database.read_genesis().expect("marker").is_none());
+        assert!(database.get_block(2).expect("read").is_none());
+        assert!(database.get_block(1).expect("read").is_some());
+        let init = database
+            .initialize_chain(9, "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG")
+            .expect_err("do not attach genesis to an existing checkpoint");
+        assert!(init.contains("already initialized"), "{init}");
+        assert!(database.read_genesis().expect("marker").is_none());
+        assert_eq!(
+            database
+                .db
+                .get(super::CHECKPOINT_KEY)
+                .expect("raw")
+                .expect("checkpoint bytes"),
+            serde_json::to_vec(&4_u64).expect("slot")
+        );
+    }
+
+    #[test]
+    fn future_and_equal_parent_slots_are_rejected() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = crate::util::test_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        database.establish_initial_checkpoint(4).expect("boundary");
+        let ahead = database
+            .handle_block(1, crate::util::Block::default(), 5, 9)
+            .expect_err("parent ahead of the fetched slot");
+        assert!(matches!(ahead, AggError::IncompatibleStorage(_)));
+        let equal = database
+            .handle_block(1, crate::util::Block::default(), 5, 5)
+            .expect_err("parent equal to the fetched slot");
+        assert!(matches!(equal, AggError::IncompatibleStorage(_)));
+        database
+            .handle_block(1, crate::util::Block::default(), 5, 4)
+            .expect("valid first parent");
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(5));
+        assert!(database.get_block(1).expect("stored").is_some());
+    }
+
+    #[test]
+    fn inconsistent_parent_and_missing_predecessor_do_not_advance() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = crate::util::test_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+                .expect("open");
+        database.establish_initial_checkpoint(4).expect("boundary");
+        database
+            .handle_block(1, crate::util::Block::default(), 5, 0)
+            .expect("first produced slot");
+        database.record_skipped_slot(6).expect("genuine skip");
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(6));
+        let parent = database
+            .handle_block(2, crate::util::Block::default(), 7, 99)
+            .expect_err("parent must continue slot 5");
+        assert!(matches!(parent, AggError::IncompatibleStorage(_)));
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(6));
+        assert!(database.get_block(2).unwrap().is_none());
+        database
+            .handle_block(2, crate::util::Block::default(), 7, 5)
+            .expect("parent continues the last produced slot");
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(7));
+        database.db.delete("BlockNo2").expect("remove predecessor");
+        let missing = database
+            .handle_block(3, crate::util::Block::default(), 8, 7)
+            .expect_err("missing predecessor");
+        assert!(matches!(missing, AggError::IncompatibleStorage(_)));
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(7));
+        assert_eq!(database.get_latest_block().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn dangling_signature_index_is_not_dropped() {
+        let directory = TempDir::new();
+        let (_sender, receiver) = crate::util::test_channel();
+        let database = RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
+            .expect("open");
+        let signature = solana_signature::Signature::from([9; 64]).to_string();
+        database
+            .db
+            .put(
+                serde_json::to_vec(&signature).expect("key"),
+                serde_json::to_vec(&99_u64).expect("height"),
+            )
+            .expect("dangling index");
+        let (reply, _inbox) = crate::util::test_channel();
+        let error = database
+            .handle_tx_request(signature.clone(), reply)
+            .expect_err("dangling reference");
+        assert!(matches!(error, AggError::IncompatibleStorage(_)));
+        assert!(database
+            .db
+            .get(serde_json::to_vec(&signature).expect("key"))
+            .expect("read")
+            .is_some());
     }
 }

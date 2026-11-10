@@ -230,13 +230,23 @@ async fn wait_for_database(
     mut inbound: Receiver<ProtocolMessage>,
     timeout: Duration,
 ) -> Result<ProtocolMessage, Box<HttpResponse>> {
-    if outbound.send(message).await.is_err() {
-        return Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Database worker is unavailable",
-        )));
+    let deadline = tokio::time::Instant::now() + timeout;
+    match tokio::time::timeout_at(deadline, outbound.send(message)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(Box::new(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database worker is unavailable",
+            )));
+        }
+        Err(_) => {
+            return Err(Box::new(api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Database request timed out",
+            )));
+        }
     }
-    match tokio::time::timeout(timeout, inbound.recv()).await {
+    match tokio::time::timeout_at(deadline, inbound.recv()).await {
         Ok(Some(reply)) => Ok(reply),
         Ok(None) => Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -458,7 +468,9 @@ mod tests {
         let zero = Pubkey::from([4; 32]).to_string();
         let signature = Signature::from([8; 64]);
         let mut block = Block::default();
-        block.push_transaction(signature, TxRecord::default());
+        block
+            .push_transaction(signature, TxRecord::default())
+            .expect("transaction");
         block.insert_account(observed.clone(), 42);
         block.insert_account(zero.clone(), 0);
         database.persist_test_block(7, 2, block).expect("block 7");
@@ -482,6 +494,20 @@ mod tests {
             db_task,
             handler_task,
         }
+    }
+
+    #[actix_web::test]
+    async fn saturated_handler_queue_hits_the_request_deadline() {
+        let (sender, _queued) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ProtocolMessage::RecordSkippedSlot(0))
+            .expect("fill the handler queue");
+        let started = std::time::Instant::now();
+        let (status, body) =
+            call_with_timeout(sender, "/latest_block", Duration::from_millis(200)).await;
+        assert_eq!(status, 504);
+        assert_eq!(body["error"], "Database request timed out");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     async fn call(sender: Sender<ProtocolMessage>, uri: &str) -> (u16, Value) {

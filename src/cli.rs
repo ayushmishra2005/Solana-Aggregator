@@ -1,6 +1,7 @@
 use structopt::StructOpt;
 
 const DEFAULT_CHAIN_URL: &str = "https://api.devnet.solana.com";
+const DEFAULT_DB_PATH: &str = "solana-agg-db";
 
 #[derive(Debug, StructOpt)]
 pub struct Cli {
@@ -16,7 +17,7 @@ pub struct Cli {
     #[structopt(
         short = "d",
         long = "db-url",
-        default_value = "/Users/krishnasingh/Workspace/Official/solana-agg/db"
+        default_value = DEFAULT_DB_PATH
     )]
     pub db_path: String,
 
@@ -32,7 +33,7 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, DEFAULT_CHAIN_URL};
+    use super::{Cli, DEFAULT_CHAIN_URL, DEFAULT_DB_PATH};
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
     use structopt::StructOpt;
@@ -140,10 +141,7 @@ mod tests {
         let _lock = lock_env();
         let _env = EnvGuard::unset();
         let defaults = parse(&["solana-agg"]);
-        assert_eq!(
-            defaults.db_path,
-            "/Users/krishnasingh/Workspace/Official/solana-agg/db"
-        );
+        assert_eq!(defaults.db_path, DEFAULT_DB_PATH);
         assert_eq!(defaults.port_no, "9944");
         assert_eq!(defaults.start_slot, None);
 

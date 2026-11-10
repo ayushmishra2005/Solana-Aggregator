@@ -18,9 +18,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install the stable Rust toolchain
+      - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Cache Cargo

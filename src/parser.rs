@@ -52,25 +52,39 @@ impl Parser {
                 let Some(signature) = transaction.signatures.first().copied() else {
                     return Err(AggError::InvalidTransactionSignature);
                 };
+                if partial_block
+                    .get_tx_details(&signature.to_string())
+                    .is_some()
+                {
+                    return Err(AggError::ConflictingBlock);
+                }
                 let message = &transaction.message;
-                let meta = tx.meta.as_ref();
-                let execution_failed = meta.and_then(|meta| meta.err.as_ref()).is_some();
+                let Some(meta) = tx.meta.as_ref() else {
+                    partial_block
+                        .push_transaction(signature, TxRecord::new(Vec::new(), None))
+                        .map_err(|()| AggError::ConflictingBlock)?;
+                    continue;
+                };
+                let execution_failed = meta.err.is_some();
                 if !execution_failed {
                     for instruction in message.instructions().iter() {
-                        if Self::is_transfer_instruction(message, instruction, meta)? {
+                        if Self::is_transfer_instruction(message, instruction, Some(meta))? {
                             instructions.push(
-                                Self::decode_transfer_instruction(message, instruction, meta)?
-                                    .instruction(),
+                                Self::decode_transfer_instruction(
+                                    message,
+                                    instruction,
+                                    Some(meta),
+                                )?
+                                .instruction(),
                             );
                         }
                     }
                 }
-                if let Some(meta) = tx.meta.clone() {
-                    Self::record_observed_balances(&mut partial_block, message, &meta)
-                        .map_err(|()| AggError::InvalidBalanceMetadata)?;
-                }
+                Self::record_observed_balances(&mut partial_block, message, meta)
+                    .map_err(|()| AggError::InvalidBalanceMetadata)?;
                 partial_block
-                    .push_transaction(signature, TxRecord::new(instructions, tx.meta.clone()));
+                    .push_transaction(signature, TxRecord::new(instructions, Some(meta.clone())))
+                    .map_err(|()| AggError::ConflictingBlock)?;
             }
             sender
                 .send(ProtocolMessage::parsed_block(
@@ -177,7 +191,8 @@ impl Parser {
     }
 
     /// `Ok(None)` means the data is not a System `Transfer`.
-    /// A complete `Transfer` discriminant with a malformed payload is an error.
+    /// A complete `Transfer` discriminant with a short payload is an error.
+    /// Agave accepts trailing bytes after the 12-byte transfer body.
     fn transfer_lamports(data: &[u8]) -> Result<Option<u64>, ()> {
         if data.len() < 4 {
             return Ok(None);
@@ -187,7 +202,7 @@ impl Parser {
         if u32::from_le_bytes(discriminant_bytes) != SYSTEM_TRANSFER_DISCRIMINANT {
             return Ok(None);
         }
-        if data.len() != SYSTEM_TRANSFER_DATA_LEN {
+        if data.len() < SYSTEM_TRANSFER_DATA_LEN {
             return Err(());
         }
         let mut lamports = [0u8; 8];
@@ -205,7 +220,7 @@ impl Parser {
     ) -> Result<(), ()> {
         let mut accounts = message.static_account_keys().to_vec();
         accounts.extend(Self::loaded_account_keys(message, meta)?);
-        if meta.post_balances.len() < accounts.len() {
+        if meta.post_balances.len() != accounts.len() {
             return Err(());
         }
         for (key, balance) in accounts.iter().zip(meta.post_balances.iter()) {
@@ -1434,16 +1449,19 @@ mod tests {
 
     #[test]
     fn malformed_lamport_payload_is_rejected() {
-        let (_from, _to, message) = transfer_keys();
+        let (from, to, message) = transfer_keys();
         let mut short = valid_transfer_instruction();
         short.data.pop();
         assert_eq!(short.data.len(), 11);
         assert_rejected(&message, &short);
 
         let mut extra = valid_transfer_instruction();
-        extra.data.push(0);
+        extra.data.push(0xAB);
         assert_eq!(extra.data.len(), 13);
-        assert_rejected(&message, &extra);
+        let decoded = Parser::decode_transfer_instruction(&message, &extra, None).unwrap();
+        assert_eq!(decoded.lamports, LAMPORTS);
+        assert_eq!(decoded.from, from);
+        assert_eq!(decoded.to, to);
     }
 
     #[test]
@@ -1647,6 +1665,112 @@ mod tests {
         )))
         .expect_err("malformed v1 transaction");
         assert!(matches!(error, AggError::InvalidTransactionSignature));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn missing_execution_metadata_is_not_a_successful_transfer() {
+        let source = Keypair::new();
+        let destination = account(12);
+        let instruction = system_instruction::transfer(&source.pubkey(), &destination, 25);
+        let message = Message::new(&[instruction], Some(&source.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&source], Hash::new_from_array([7; 32]))
+            .expect("sign");
+        let versioned = VersionedTransaction::from(transaction);
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: None,
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let block = parse_accounts(encoded);
+        let value = serde_json::to_value(
+            block
+                .get_tx_details(&versioned.signatures[0].to_string())
+                .expect("signature retained"),
+        )
+        .expect("record");
+        assert!(value["instruction"]
+            .as_array()
+            .expect("instructions")
+            .is_empty());
+        assert!(value["metadata"].is_null());
+        assert!(block
+            .get_account_balance(&source.pubkey().to_string())
+            .is_none());
+    }
+
+    #[test]
+    fn unexpected_extra_post_balance_is_rejected() {
+        let source = Keypair::new();
+        let destination = account(12);
+        let instruction = system_instruction::transfer(&source.pubkey(), &destination, 25);
+        let message = Message::new(&[instruction], Some(&source.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&source], Hash::new_from_array([7; 32]))
+            .expect("sign");
+        let versioned = VersionedTransaction::from(transaction);
+        let mut meta = balances_meta(vec![9, 8, 1]);
+        meta.post_balances.push(4);
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(meta),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        assert_balance_error(encoded);
+    }
+
+    #[test]
+    fn duplicate_signature_in_one_block_is_rejected() {
+        let source = Keypair::new();
+        let destination = account(12);
+        let instruction = system_instruction::transfer(&source.pubkey(), &destination, 25);
+        let message = Message::new(&[instruction], Some(&source.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&source], Hash::new_from_array([7; 32]))
+            .expect("sign");
+        let versioned = VersionedTransaction::from(transaction);
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(balances_meta(vec![9, 8, 1])),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let identical = encoded.clone();
+        let mut changed = encoded.clone();
+        changed.meta.as_mut().expect("meta").fee += 1;
+        let (sender, mut receiver) = crate::util::test_channel();
+        let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            1,
+            0,
+            1,
+            vec![encoded, changed],
+            sender,
+        )))
+        .expect_err("duplicate signature");
+        assert!(matches!(error, AggError::ConflictingBlock));
+        assert!(receiver.try_recv().is_err());
+        let (sender, mut receiver) = crate::util::test_channel();
+        let repeated = block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            1,
+            0,
+            1,
+            vec![identical.clone(), identical],
+            sender,
+        )))
+        .expect_err("identical signature repeated in the chunk");
+        assert!(matches!(repeated, AggError::ConflictingBlock));
         assert!(receiver.try_recv().is_err());
     }
 }
