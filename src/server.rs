@@ -1,5 +1,8 @@
 use crate::error::AggError;
-use crate::util::{Channel, ProtocolMessage, QueryFailureKind, QueryParams, MAX_API_BLOCK_RANGE};
+use crate::util::{
+    Channel, ProtocolMessage, QueryFailureKind, QueryParams, MAX_API_BLOCK_RANGE,
+    REPLY_CHANNEL_CAPACITY,
+};
 use actix_web::http::StatusCode;
 use actix_web::{get, middleware, web, App, HttpResponse, HttpServer, Responder};
 use serde::Serialize;
@@ -7,18 +10,18 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use std::str::FromStr;
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct ApiState {
-    sender: UnboundedSender<ProtocolMessage>,
+    sender: Sender<ProtocolMessage>,
     db_timeout: Duration,
 }
 
 impl ApiState {
-    fn production(sender: UnboundedSender<ProtocolMessage>) -> Self {
+    fn production(sender: Sender<ProtocolMessage>) -> Self {
         Self {
             sender,
             db_timeout: DATABASE_TIMEOUT,
@@ -26,7 +29,7 @@ impl ApiState {
     }
 
     #[cfg(test)]
-    fn with_timeout(sender: UnboundedSender<ProtocolMessage>, db_timeout: Duration) -> Self {
+    fn with_timeout(sender: Sender<ProtocolMessage>, db_timeout: Duration) -> Self {
         Self { sender, db_timeout }
     }
 }
@@ -39,14 +42,14 @@ impl AggServer {
     ///
     /// # Arguments
     ///
-    /// * `handler_sender` - A UnboundedSender<ProtocolMessage> that holds the handler sender
+    /// * `handler_sender` - A Sender<ProtocolMessage> that holds the handler sender
     /// * `port_no` - A string slice that holds the port number
     ///
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
     pub async fn run(
-        handler_sender: UnboundedSender<ProtocolMessage>,
+        handler_sender: Sender<ProtocolMessage>,
         port_no: String,
     ) -> Result<(), AggError> {
         let state = ApiState::production(handler_sender);
@@ -137,12 +140,12 @@ fn parse_optional_block(value: Option<String>) -> Result<Option<u64>, &'static s
 }
 
 async fn wait_for_database(
-    outbound: &UnboundedSender<ProtocolMessage>,
+    outbound: &Sender<ProtocolMessage>,
     message: ProtocolMessage,
-    mut inbound: UnboundedReceiver<ProtocolMessage>,
+    mut inbound: Receiver<ProtocolMessage>,
     timeout: Duration,
 ) -> Result<ProtocolMessage, HttpResponse> {
-    if outbound.send(message).is_err() {
+    if outbound.send(message).await.is_err() {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Database worker is unavailable",
@@ -184,7 +187,7 @@ async fn get_tx_details(tx_id: web::Path<String>, state: web::Data<ApiState>) ->
         Ok(signature) => signature,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
     };
-    let channel = Channel::new();
+    let channel = Channel::new(REPLY_CHANNEL_CAPACITY);
     let reply = match wait_for_database(
         &state.sender,
         ProtocolMessage::FetchTransactionDetails(signature, channel.sender()),
@@ -208,7 +211,7 @@ async fn get_block_details(
         Ok(block_no) => block_no,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
     };
-    let channel = Channel::new();
+    let channel = Channel::new(REPLY_CHANNEL_CAPACITY);
     let reply = match wait_for_database(
         &state.sender,
         ProtocolMessage::FetchBlockDetails(block_no.to_string(), channel.sender()),
@@ -225,7 +228,7 @@ async fn get_block_details(
 
 #[get("/latest_block")]
 async fn get_latest_block(state: web::Data<ApiState>) -> impl Responder {
-    let channel = Channel::new();
+    let channel = Channel::new(REPLY_CHANNEL_CAPACITY);
     let reply = match wait_for_database(
         &state.sender,
         ProtocolMessage::FetchLatestBlock(channel.sender()),
@@ -250,7 +253,7 @@ async fn get_block_range(
         Ok(bounds) => bounds,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
     };
-    let channel = Channel::new();
+    let channel = Channel::new(REPLY_CHANNEL_CAPACITY);
     let reply = match wait_for_database(
         &state.sender,
         ProtocolMessage::FetchBlockRange(start, end, channel.sender()),
@@ -279,7 +282,7 @@ async fn get_account_balance(
         Ok(block_no) => block_no,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
     };
-    let channel = Channel::new();
+    let channel = Channel::new(REPLY_CHANNEL_CAPACITY);
     let reply = match wait_for_database(
         &state.sender,
         ProtocolMessage::FetchAccountBalance(address, block_no, channel.sender()),
@@ -306,7 +309,7 @@ mod tests {
     use solana_signature::Signature;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+    use tokio::sync::mpsc::Sender;
     use tokio::task::JoinHandle;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -345,7 +348,7 @@ mod tests {
         observed: String,
         zero: String,
         signature: String,
-        sender: UnboundedSender<ProtocolMessage>,
+        sender: Sender<ProtocolMessage>,
         db_task: JoinHandle<()>,
         handler_task: JoinHandle<()>,
     }
@@ -360,8 +363,8 @@ mod tests {
     async fn indexed() -> Running {
         let dir = TempDir::new();
         let path = dir.path.to_string_lossy().to_string();
-        let (db_sender, db_receiver) = unbounded_channel();
-        let (handler_sender, handler_receiver) = unbounded_channel();
+        let (db_sender, db_receiver) = crate::util::test_channel();
+        let (handler_sender, handler_receiver) = crate::util::test_channel();
         let mut database = RocksDb::initialize(path.clone(), db_receiver).expect("database");
         database
             .establish_initial_checkpoint(1)
@@ -396,12 +399,12 @@ mod tests {
         }
     }
 
-    async fn call(sender: UnboundedSender<ProtocolMessage>, uri: &str) -> (u16, Value) {
+    async fn call(sender: Sender<ProtocolMessage>, uri: &str) -> (u16, Value) {
         call_with_timeout(sender, uri, Duration::from_secs(5)).await
     }
 
     async fn call_with_timeout(
-        sender: UnboundedSender<ProtocolMessage>,
+        sender: Sender<ProtocolMessage>,
         uri: &str,
         timeout: Duration,
     ) -> (u16, Value) {
@@ -419,15 +422,15 @@ mod tests {
     }
 
     async fn empty_service() -> (
-        UnboundedSender<ProtocolMessage>,
+        Sender<ProtocolMessage>,
         JoinHandle<()>,
         JoinHandle<()>,
         TempDir,
     ) {
         let dir = TempDir::new();
-        let (db_sender, db_receiver) = unbounded_channel();
-        let (handler_sender, handler_receiver) = unbounded_channel();
-        let mut database =
+        let (db_sender, db_receiver) = crate::util::test_channel();
+        let (handler_sender, handler_receiver) = crate::util::test_channel();
+        let database =
             RocksDb::initialize(dir.path.to_string_lossy().to_string(), db_receiver).expect("db");
         let db_task = tokio::spawn(async move { database.run().await });
         let mut handler = Handler::initialize(handler_receiver, db_sender);
@@ -570,7 +573,7 @@ mod tests {
 
     #[actix_web::test]
     async fn closed_handler_channel_is_service_unavailable() {
-        let (sender, receiver) = unbounded_channel();
+        let (sender, receiver) = crate::util::test_channel();
         drop(receiver);
         let (status, body) = call(sender, "/latest_block").await;
         assert_eq!(status, 503);
@@ -579,8 +582,8 @@ mod tests {
 
     #[actix_web::test]
     async fn closed_database_worker_is_service_unavailable() {
-        let (handler_sender, handler_receiver) = unbounded_channel();
-        let (db_sender, db_receiver) = unbounded_channel();
+        let (handler_sender, handler_receiver) = crate::util::test_channel();
+        let (db_sender, db_receiver) = crate::util::test_channel();
         drop(db_receiver);
         let mut handler = Handler::initialize(handler_receiver, db_sender);
         let handler_task = tokio::spawn(async move { handler.run().await });
@@ -593,7 +596,7 @@ mod tests {
 
     #[actix_web::test]
     async fn unanswered_database_request_times_out() {
-        let (sender, _receiver) = unbounded_channel();
+        let (sender, _receiver) = crate::util::test_channel();
         let (status, body) =
             call_with_timeout(sender, "/latest_block", Duration::from_millis(50)).await;
         assert_eq!(status, 504);
@@ -604,9 +607,9 @@ mod tests {
     async fn corrupt_block_is_an_internal_error_without_a_database_path() {
         let dir = TempDir::new();
         let path = dir.path.to_string_lossy().to_string();
-        let (db_sender, db_receiver) = unbounded_channel();
-        let (handler_sender, handler_receiver) = unbounded_channel();
-        let mut database = RocksDb::initialize(path.clone(), db_receiver).expect("db");
+        let (db_sender, db_receiver) = crate::util::test_channel();
+        let (handler_sender, handler_receiver) = crate::util::test_channel();
+        let database = RocksDb::initialize(path.clone(), db_receiver).expect("db");
         database.corrupt_block_record(4).expect("corrupt");
         let db_task = tokio::spawn(async move { database.run().await });
         let mut handler = Handler::initialize(handler_receiver, db_sender);

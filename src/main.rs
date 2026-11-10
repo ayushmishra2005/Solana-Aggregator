@@ -1,9 +1,12 @@
 use crate::builder::Builder;
 use crate::cli::Cli;
-use crate::util::{Channel, ProtocolMessage};
+use crate::util::{
+    Channel, ProtocolMessage, DATABASE_CHANNEL_CAPACITY, HANDLER_CHANNEL_CAPACITY,
+    OUTCOME_CHANNEL_CAPACITY,
+};
 use log::error;
 use structopt::StructOpt;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::channel;
 
 mod block_importer;
 mod builder;
@@ -55,14 +58,15 @@ fn resume_subscriber(
 async fn main() {
     install_stderr_logger();
     let opt: Cli = Cli::from_args();
-    let handler_channel = Channel::<ProtocolMessage>::new();
-    let db_channel = Channel::<ProtocolMessage>::new();
-    let (block_outcome_sender, block_outcome_receiver) = unbounded_channel();
+    let handler_channel = Channel::<ProtocolMessage>::new(HANDLER_CHANNEL_CAPACITY);
+    let db_channel = Channel::<ProtocolMessage>::new(DATABASE_CHANNEL_CAPACITY);
+    let (block_outcome_sender, block_outcome_receiver) = channel(OUTCOME_CHANNEL_CAPACITY);
     let handler_channel_receiver_server = handler_channel.sender();
     let mut subscriber_client = match Builder::default()
         .chain_url(opt.chain_url)
         .router_sender(handler_channel.sender())
         .build()
+        .await
     {
         Ok(subscriber) => subscriber,
         Err(e) => {

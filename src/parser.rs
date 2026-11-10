@@ -77,12 +77,14 @@ impl Parser {
                 partial_block
                     .push_transaction(signature, TxRecord::new(instructions, tx.meta.clone()));
             }
-            sender.send(ProtocolMessage::parsed_block(
-                block_no,
-                total_chunks,
-                chunk_no,
-                partial_block,
-            ))?;
+            sender
+                .send(ProtocolMessage::parsed_block(
+                    block_no,
+                    total_chunks,
+                    chunk_no,
+                    partial_block,
+                ))
+                .await?;
         };
         Ok(())
     }
@@ -288,7 +290,6 @@ mod tests {
         EncodableWithMeta, EncodedTransactionWithStatusMeta, TransactionStatusMeta,
         UiLoadedAddresses, UiTransactionEncoding, UiTransactionStatusMeta,
     };
-    use tokio::sync::mpsc::unbounded_channel;
 
     const LAMPORTS: u64 = 2_500_000_000;
 
@@ -541,7 +542,7 @@ mod tests {
     }
 
     fn parse_accounts(transaction: EncodedTransactionWithStatusMeta) -> Block {
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         block_on(Parser::invoke(ProtocolMessage::new_chuck(
             1,
             0,
@@ -558,7 +559,7 @@ mod tests {
     }
 
     fn assert_balance_error(transaction: EncodedTransactionWithStatusMeta) {
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
             1,
             0,
@@ -775,7 +776,7 @@ mod tests {
         let key = account(40);
         let first = encoded_with_signature(vec![key], Some(vec![10]), 4);
         let second = encoded_with_signature(vec![key], Some(vec![99]), 5);
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         block_on(Parser::invoke(ProtocolMessage::new_chuck(
             3,
             0,
@@ -1026,7 +1027,7 @@ mod tests {
             21,
             Some(Some(loaded(&[loaded_account], &[]))),
         );
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         block_on(Parser::invoke(ProtocolMessage::new_chuck(
             9,
             0,
@@ -1625,7 +1626,7 @@ mod tests {
         };
         blob.truncate(8);
         let _ = encoding;
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
             1,
             0,

@@ -1,9 +1,9 @@
 use crate::error::AggError;
 use crate::parser::Parser;
-use crate::util::ProtocolMessage;
+use crate::util::{ProtocolMessage, PARSER_CONCURRENCY};
 use log::{error, warn};
 use solana_client::client_error::{ClientError, ClientErrorKind};
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_client::rpc_custom_error::{
     JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
@@ -11,10 +11,14 @@ use solana_client::rpc_custom_error::{
 };
 use solana_client::rpc_request::RpcError;
 use solana_commitment_config::CommitmentConfig;
-use solana_transaction_status::{UiConfirmedBlock, UiTransactionEncoding};
+use solana_transaction_status::{
+    EncodedTransactionWithStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
+};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::Mutex;
 
 const MAX_GET_BLOCK_ATTEMPTS: u32 = 3;
 const INITIAL_GET_BLOCK_BACKOFF: Duration = Duration::from_millis(200);
@@ -45,14 +49,135 @@ fn finalized_block_config() -> RpcBlockConfig {
     }
 }
 
+struct ParseJob {
+    fetch_slot: u64,
+    block_no: u64,
+    chunk_index: u64,
+    total_chunks: u64,
+    transactions: Vec<EncodedTransactionWithStatusMeta>,
+    handler_sender: Sender<ProtocolMessage>,
+    outcome_sender: Option<Sender<ProtocolMessage>>,
+}
+
+#[cfg(test)]
+struct ParserGate {
+    hold: std::sync::atomic::AtomicBool,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static PARSER_GATE: ParserGate = ParserGate {
+    hold: std::sync::atomic::AtomicBool::new(false),
+    in_flight: std::sync::atomic::AtomicUsize::new(0),
+    max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+    completed: std::sync::atomic::AtomicUsize::new(0),
+    release: tokio::sync::Notify::const_new(),
+};
+
+fn parser_channel() -> (Sender<ParseJob>, tokio::sync::mpsc::Receiver<ParseJob>) {
+    tokio::sync::mpsc::channel(PARSER_CONCURRENCY)
+}
+
+fn spawn_parser_workers(receiver: tokio::sync::mpsc::Receiver<ParseJob>) {
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..PARSER_CONCURRENCY {
+        let receiver = Arc::clone(&receiver);
+        tokio::spawn(async move {
+            loop {
+                let job = {
+                    let mut queue = receiver.lock().await;
+                    queue.recv().await
+                };
+                let Some(job) = job else {
+                    break;
+                };
+                #[cfg(test)]
+                if PARSER_GATE.hold.load(std::sync::atomic::Ordering::SeqCst) {
+                    let current = PARSER_GATE
+                        .in_flight
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    PARSER_GATE
+                        .max_in_flight
+                        .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                    PARSER_GATE.release.notified().await;
+                    PARSER_GATE
+                        .in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                run_parse_job(job).await;
+                #[cfg(test)]
+                {
+                    PARSER_GATE
+                        .completed
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+fn start_parser_workers() -> Sender<ParseJob> {
+    let (sender, receiver) = parser_channel();
+    spawn_parser_workers(receiver);
+    sender
+}
+
+async fn run_parse_job(job: ParseJob) {
+    let ParseJob {
+        fetch_slot,
+        block_no,
+        chunk_index,
+        total_chunks,
+        transactions,
+        handler_sender,
+        outcome_sender,
+    } = job;
+    if let Err(error) = Parser::invoke(ProtocolMessage::new_chuck(
+        block_no,
+        chunk_index,
+        total_chunks,
+        transactions,
+        handler_sender.clone(),
+    ))
+    .await
+    {
+        error!(target: "subscriber", "Error from Parser {}", error);
+        let reported = handler_sender
+            .send(ProtocolMessage::ChunkFailed(
+                block_no,
+                fetch_slot,
+                error.to_string(),
+            ))
+            .await
+            .is_ok();
+        if !reported {
+            if let Some(outcome) = outcome_sender {
+                let _ = outcome
+                    .send(ProtocolMessage::BlockProcessingResult(
+                        fetch_slot,
+                        Err(error.to_string()),
+                    ))
+                    .await;
+            }
+        }
+    }
+}
+
 pub struct Subscriber {
     latest_slot: u64,
     chain_url: String,
     rpc_client: RpcClient,
     rpc_block_config: RpcBlockConfig,
-    unbounded_sender: UnboundedSender<ProtocolMessage>,
-    outcome_tx: Option<UnboundedSender<ProtocolMessage>>,
-    outcome_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>>,
+    handler_sender: Sender<ProtocolMessage>,
+    parser_jobs: Sender<ParseJob>,
+    parser_inbox: Option<tokio::sync::mpsc::Receiver<ParseJob>>,
+    outcome_tx: Option<Sender<ProtocolMessage>>,
+    outcome_rx: Option<tokio::sync::mpsc::Receiver<ProtocolMessage>>,
 }
 
 impl Subscriber {
@@ -67,19 +192,25 @@ impl Subscriber {
     /// # Returns
     ///
     /// * `Result<Self, AggError>` - A Result that holds the Subscriber client or an error
-    pub fn initialize(
+    pub async fn initialize(
         chain_url: String,
-        message_sender: UnboundedSender<ProtocolMessage>,
+        message_sender: Sender<ProtocolMessage>,
     ) -> Result<Self, AggError> {
-        let rpc_client = RpcClient::new(&chain_url);
+        let rpc_client = RpcClient::new(chain_url.clone());
         let rpc_block_config = finalized_block_config();
-        let latest_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::finalized())?;
+        let latest_slot = rpc_client
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .await?;
+        let (parser_jobs, parser_inbox) = parser_channel();
+        spawn_parser_workers(parser_inbox);
         Ok(Self {
             latest_slot,
             chain_url,
             rpc_client,
             rpc_block_config,
-            unbounded_sender: message_sender,
+            handler_sender: message_sender,
+            parser_jobs,
+            parser_inbox: None,
             outcome_tx: None,
             outcome_rx: None,
         })
@@ -95,17 +226,18 @@ impl Subscriber {
 
     pub fn set_block_outcomes(
         &mut self,
-        sender: UnboundedSender<ProtocolMessage>,
-        receiver: tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+        sender: Sender<ProtocolMessage>,
+        receiver: tokio::sync::mpsc::Receiver<ProtocolMessage>,
     ) {
         self.outcome_tx = Some(sender);
         self.outcome_rx = Some(receiver);
     }
 
-    fn fetch_latest_slot(&self) -> Result<u64, AggError> {
+    async fn fetch_latest_slot(&self) -> Result<u64, AggError> {
         let slot = self
             .rpc_client
-            .get_slot_with_commitment(CommitmentConfig::finalized())?;
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .await?;
         Ok(slot)
     }
 
@@ -124,7 +256,10 @@ impl Subscriber {
     /// a fetched block or an authoritative skip. A failed fetch leaves the cursor
     /// on the last progressed slot.
     async fn advance_once(&mut self) -> SlotProgress {
-        let fetched_slot = match self.fetch_latest_slot() {
+        if let Some(inbox) = self.parser_inbox.take() {
+            spawn_parser_workers(inbox);
+        }
+        let fetched_slot = match self.fetch_latest_slot().await {
             Ok(slot) => slot,
             Err(err) => {
                 error!(target: "subscriber", "Failed to fetch latest slot {:?}", err);
@@ -141,16 +276,18 @@ impl Subscriber {
                 self.chain_url.clone(),
                 self.rpc_block_config,
                 slot,
-                self.unbounded_sender.clone(),
+                self.handler_sender.clone(),
             ),
             self.outcome_tx.as_ref(),
+            &self.parser_jobs,
         )
         .await;
         match outcome {
             BlockFetch::Skipped(_) => {
                 if self
-                    .unbounded_sender
+                    .handler_sender
                     .send(ProtocolMessage::RecordSkippedSlot(slot))
+                    .await
                     .is_err()
                 {
                     return SlotProgress::Halted(format!(
@@ -220,11 +357,20 @@ impl BlockFetcher {
     async fn invoke(
         client: &RpcClient,
         message: ProtocolMessage,
-        outcome_sender: Option<&UnboundedSender<ProtocolMessage>>,
+        outcome_sender: Option<&Sender<ProtocolMessage>>,
+        parser_jobs: &Sender<ParseJob>,
     ) -> BlockFetch {
         match message {
             ProtocolMessage::FetchBlock(_chain_url, rpc_block_config, slot, sender) => {
-                Self::request_block(client, slot, rpc_block_config, sender, outcome_sender).await
+                Self::request_block(
+                    client,
+                    slot,
+                    rpc_block_config,
+                    sender,
+                    outcome_sender,
+                    parser_jobs,
+                )
+                .await
             }
             _ => BlockFetch::Failed(AggError::ClientError(ClientError::from(
                 ClientErrorKind::Custom("block fetcher received an unexpected message".to_string()),
@@ -236,8 +382,9 @@ impl BlockFetcher {
         client: &RpcClient,
         slot: u64,
         rpc_block_config: RpcBlockConfig,
-        sender: UnboundedSender<ProtocolMessage>,
-        outcome_sender: Option<&UnboundedSender<ProtocolMessage>>,
+        sender: Sender<ProtocolMessage>,
+        outcome_sender: Option<&Sender<ProtocolMessage>>,
+        parser_jobs: &Sender<ParseJob>,
     ) -> BlockFetch {
         Self::request_block_retrying(
             client,
@@ -245,6 +392,7 @@ impl BlockFetcher {
             rpc_block_config,
             sender,
             outcome_sender,
+            parser_jobs,
             Self::pause,
         )
         .await
@@ -254,8 +402,9 @@ impl BlockFetcher {
         client: &RpcClient,
         slot: u64,
         rpc_block_config: RpcBlockConfig,
-        sender: UnboundedSender<ProtocolMessage>,
-        outcome_sender: Option<&UnboundedSender<ProtocolMessage>>,
+        sender: Sender<ProtocolMessage>,
+        outcome_sender: Option<&Sender<ProtocolMessage>>,
+        parser_jobs: &Sender<ParseJob>,
         mut pause: P,
     ) -> BlockFetch
     where
@@ -263,15 +412,29 @@ impl BlockFetcher {
         F: Future<Output = ()>,
     {
         for attempt in 1..=MAX_GET_BLOCK_ATTEMPTS {
-            match client.get_block_with_config(slot, rpc_block_config) {
+            match client.get_block_with_config(slot, rpc_block_config).await {
                 Ok(block) => {
                     let outcome = BlockFetch::Fetched(block);
-                    Self::dispatch_block_fetch(slot, &outcome, &sender, outcome_sender);
+                    Self::dispatch_block_fetch(
+                        slot,
+                        &outcome,
+                        &sender,
+                        outcome_sender,
+                        parser_jobs,
+                    )
+                    .await;
                     return outcome;
                 }
                 Err(err) if Self::is_explicit_slot_skip(&err) => {
                     let outcome = BlockFetch::Skipped(slot);
-                    Self::dispatch_block_fetch(slot, &outcome, &sender, outcome_sender);
+                    Self::dispatch_block_fetch(
+                        slot,
+                        &outcome,
+                        &sender,
+                        outcome_sender,
+                        parser_jobs,
+                    )
+                    .await;
                     return outcome;
                 }
                 Err(err)
@@ -287,7 +450,14 @@ impl BlockFetcher {
                 }
                 Err(err) => {
                     let outcome = BlockFetch::Failed(AggError::from(err));
-                    Self::dispatch_block_fetch(slot, &outcome, &sender, outcome_sender);
+                    Self::dispatch_block_fetch(
+                        slot,
+                        &outcome,
+                        &sender,
+                        outcome_sender,
+                        parser_jobs,
+                    )
+                    .await;
                     return outcome;
                 }
             }
@@ -365,11 +535,12 @@ impl BlockFetcher {
         )
     }
 
-    fn dispatch_block_fetch(
+    async fn dispatch_block_fetch(
         fetch_slot: u64,
         outcome: &BlockFetch,
-        sender: &UnboundedSender<ProtocolMessage>,
-        outcome_sender: Option<&UnboundedSender<ProtocolMessage>>,
+        sender: &Sender<ProtocolMessage>,
+        outcome_sender: Option<&Sender<ProtocolMessage>>,
+        parser_jobs: &Sender<ParseJob>,
     ) {
         match outcome {
             BlockFetch::Fetched(block) => {
@@ -380,59 +551,65 @@ impl BlockFetcher {
                         if len_of_chunks == 0 {
                             if sender
                                 .send(ProtocolMessage::StoreEmptyBlock(block_no, fetch_slot))
+                                .await
                                 .is_err()
                             {
                                 Self::report_processing(
                                     outcome_sender,
                                     fetch_slot,
                                     Err("database channel closed".to_string()),
-                                );
+                                )
+                                .await;
                             }
                             return;
                         }
-                        let _ = sender.send(ProtocolMessage::ExpectBlock(
-                            fetch_slot,
-                            block_no,
-                            len_of_chunks,
-                        ));
+                        if sender
+                            .send(ProtocolMessage::ExpectBlock(
+                                fetch_slot,
+                                block_no,
+                                len_of_chunks,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            Self::report_processing(
+                                outcome_sender,
+                                fetch_slot,
+                                Err("database channel closed".to_string()),
+                            )
+                            .await;
+                            return;
+                        }
                         for (index, chunk) in chunks.enumerate() {
-                            let sender_clone = sender.clone();
-                            let outcome_clone = outcome_sender.cloned();
-                            let chunk_clone = chunk.to_vec();
-                            tokio::spawn(async move {
-                                if let Err(error) = Parser::invoke(ProtocolMessage::new_chuck(
+                            if parser_jobs
+                                .send(ParseJob {
+                                    fetch_slot,
                                     block_no,
-                                    index as u64,
-                                    len_of_chunks,
-                                    chunk_clone,
-                                    sender_clone.clone(),
-                                ))
+                                    chunk_index: index as u64,
+                                    total_chunks: len_of_chunks,
+                                    transactions: chunk.to_vec(),
+                                    handler_sender: sender.clone(),
+                                    outcome_sender: outcome_sender.cloned(),
+                                })
                                 .await
-                                {
-                                    error!(target: "subscriber", "Error from Parser {}", error);
-                                    let reported = sender_clone
-                                        .send(ProtocolMessage::ChunkFailed(
-                                            block_no,
-                                            fetch_slot,
-                                            error.to_string(),
-                                        ))
-                                        .is_ok();
-                                    if !reported {
-                                        Self::report_processing(
-                                            outcome_clone.as_ref(),
-                                            fetch_slot,
-                                            Err(error.to_string()),
-                                        );
-                                    }
-                                }
-                            });
+                                .is_err()
+                            {
+                                Self::report_processing(
+                                    outcome_sender,
+                                    fetch_slot,
+                                    Err("parser workers stopped".to_string()),
+                                )
+                                .await;
+                                return;
+                            }
                         }
                     } else {
                         Self::report_processing(
                             outcome_sender,
                             fetch_slot,
                             Err("fetched block did not include transactions".to_string()),
-                        );
+                        )
+                        .await;
                     }
                 } else {
                     warn!(target: "subscriber", "Block Number not available");
@@ -440,7 +617,8 @@ impl BlockFetcher {
                         outcome_sender,
                         fetch_slot,
                         Err("fetched block has no block height".to_string()),
-                    );
+                    )
+                    .await;
                 }
             }
             BlockFetch::Skipped(slot) => {
@@ -452,15 +630,17 @@ impl BlockFetcher {
         }
     }
 
-    fn report_processing(
-        outcome_sender: Option<&UnboundedSender<ProtocolMessage>>,
+    async fn report_processing(
+        outcome_sender: Option<&Sender<ProtocolMessage>>,
         fetch_slot: u64,
         result: Result<(), String>,
     ) {
         let Some(sender) = outcome_sender else {
             return;
         };
-        let _ = sender.send(ProtocolMessage::BlockProcessingResult(fetch_slot, result));
+        let _ = sender
+            .send(ProtocolMessage::BlockProcessingResult(fetch_slot, result))
+            .await;
     }
 }
 
@@ -468,7 +648,8 @@ impl BlockFetcher {
 mod tests {
     use super::BlockFetcher;
     use solana_client::client_error::Result as RpcResult;
-    use solana_client::rpc_client::{RpcClient, RpcClientConfig};
+    use solana_client::nonblocking::rpc_client::RpcClient;
+    use solana_client::rpc_client::RpcClientConfig;
     use solana_client::rpc_config::RpcBlockConfig;
     use solana_client::rpc_request::RpcRequest;
     use solana_client::rpc_sender::{RpcSender, RpcTransportStats};
@@ -516,12 +697,13 @@ mod tests {
             },
             RpcClientConfig::with_commitment(CommitmentConfig::finalized()),
         );
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let config = super::finalized_block_config();
 
-        block_on(BlockFetcher::request_block(
-            &client, slot, config, sender, None,
-        ));
+        block_on(async {
+            let jobs = super::start_parser_workers();
+            BlockFetcher::request_block(&client, slot, config, sender, None, &jobs).await
+        });
 
         let calls = calls.lock().expect("rpc recorder");
         assert_eq!(calls.len(), 1, "slot {slot} should issue one RPC request");
@@ -624,8 +806,7 @@ mod tests {
             commitment: Some(CommitmentConfig::finalized()),
             max_supported_transaction_version: Some(1),
         };
-        let raw = client
-            .get_block_with_config(100, config)
+        let raw = block_on(client.get_block_with_config(100, config))
             .expect_err("closed local port should fail getBlock");
         let raw_display = raw.to_string();
         let raw_debug = format!("{raw:?}");
@@ -645,16 +826,18 @@ mod tests {
             assert!(output.contains("127.0.0.1"), "{output}");
         }
 
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let logged = capture_fetch_logs(|| {
             log::set_max_level(log::LevelFilter::Warn);
             block_on(async {
+                let jobs = super::start_parser_workers();
                 BlockFetcher::request_block_retrying(
                     &client,
                     100,
                     config,
                     sender,
                     None,
+                    &jobs,
                     |_delay| futures_util::future::ready(()),
                 )
                 .await;
@@ -756,7 +939,7 @@ mod tests {
     struct FetchTrial {
         outcome: BlockFetch,
         calls: Vec<(RpcRequest, serde_json::Value)>,
-        receiver: tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+        receiver: tokio::sync::mpsc::Receiver<ProtocolMessage>,
         delays: Vec<Duration>,
     }
 
@@ -765,15 +948,17 @@ mod tests {
         responses: Vec<RpcResult<serde_json::Value>>,
     ) -> FetchTrial {
         let (client, calls) = scripted_client(responses);
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let delays = Arc::new(Mutex::new(Vec::new()));
         let delay_log = Arc::clone(&delays);
+        let jobs = super::start_parser_workers();
         let outcome = BlockFetcher::request_block_retrying(
             &client,
             slot,
             block_config(),
             sender,
             None,
+            &jobs,
             move |delay| {
                 delay_log.lock().expect("backoff log").push(delay);
                 futures_util::future::ready(())
@@ -927,20 +1112,18 @@ mod tests {
         assert!(trial.delays.is_empty());
         assert_finalized_get_block(&trial.calls, slot);
         assert!(trial.receiver.try_recv().is_err());
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let (client, _) = scripted_client(vec![Err(rpc_failure(
             JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
             format!("Slot {slot} was skipped, or missing due to ledger jump to recent snapshot"),
         ))]);
         let logged = capture_fetch_logs(|| {
             log::set_max_level(log::LevelFilter::Warn);
-            block_on(BlockFetcher::request_block(
-                &client,
-                slot,
-                block_config(),
-                sender,
-                None,
-            ));
+            block_on(async {
+                let jobs = super::start_parser_workers();
+                BlockFetcher::request_block(&client, slot, block_config(), sender, None, &jobs)
+                    .await
+            });
             log::set_max_level(log::LevelFilter::Error);
         });
         let skipped_line = logged
@@ -1051,18 +1234,23 @@ mod tests {
     fn rate_limited_get_block_is_a_failure() {
         let url = local_http("429 Too Many Requests", false);
         let client = RpcClient::new_with_timeout(url, Duration::from_secs(5));
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let mut outcome = None;
         let logged = capture_fetch_logs(|| {
             log::set_max_level(log::LevelFilter::Warn);
-            outcome = Some(block_on(BlockFetcher::request_block_retrying(
-                &client,
-                100,
-                block_config(),
-                sender,
-                None,
-                |_delay| futures_util::future::ready(()),
-            )));
+            outcome = Some(block_on(async {
+                let jobs = super::start_parser_workers();
+                BlockFetcher::request_block_retrying(
+                    &client,
+                    100,
+                    block_config(),
+                    sender,
+                    None,
+                    &jobs,
+                    |_delay| futures_util::future::ready(()),
+                )
+                .await
+            }));
             log::set_max_level(log::LevelFilter::Error);
         });
         let outcome = outcome.expect("rate-limited fetch");
@@ -1075,17 +1263,22 @@ mod tests {
     fn timed_out_get_block_is_a_failure() {
         let url = local_http("200 OK", true);
         let client = RpcClient::new_with_timeout(url, Duration::from_millis(200));
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let mut outcome = None;
         let logged = capture_fetch_logs(|| {
-            outcome = Some(block_on(BlockFetcher::request_block_retrying(
-                &client,
-                100,
-                block_config(),
-                sender,
-                None,
-                |_delay| futures_util::future::ready(()),
-            )));
+            outcome = Some(block_on(async {
+                let jobs = super::start_parser_workers();
+                BlockFetcher::request_block_retrying(
+                    &client,
+                    100,
+                    block_config(),
+                    sender,
+                    None,
+                    &jobs,
+                    |_delay| futures_util::future::ready(()),
+                )
+                .await
+            }));
         });
         let outcome = outcome.expect("timed out fetch");
         assert_failed_without_block_or_secret(outcome, &logged);
@@ -1100,18 +1293,23 @@ mod tests {
             format!("http://127.0.0.1:1/?api-key={RPC_SECRET}"),
             Duration::from_secs(2),
         );
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
         let mut outcome = None;
         let logged = capture_fetch_logs(|| {
             log::set_max_level(log::LevelFilter::Warn);
-            outcome = Some(block_on(BlockFetcher::request_block_retrying(
-                &client,
-                100,
-                block_config(),
-                sender,
-                None,
-                |_delay| futures_util::future::ready(()),
-            )));
+            outcome = Some(block_on(async {
+                let jobs = super::start_parser_workers();
+                BlockFetcher::request_block_retrying(
+                    &client,
+                    100,
+                    block_config(),
+                    sender,
+                    None,
+                    &jobs,
+                    |_delay| futures_util::future::ready(()),
+                )
+                .await
+            }));
             log::set_max_level(log::LevelFilter::Error);
         });
         let outcome = outcome.expect("transport failure");
@@ -1126,13 +1324,12 @@ mod tests {
 
     fn live_get_block_error(url: String, timeout: Duration) -> ClientError {
         let client = RpcClient::new_with_timeout(url, timeout);
-        client
-            .get_block_with_config(100, block_config())
+        block_on(client.get_block_with_config(100, block_config()))
             .expect_err("live getBlock failure")
     }
 
     async fn wait_for_one_parsed(
-        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+        receiver: &mut tokio::sync::mpsc::Receiver<ProtocolMessage>,
     ) -> ProtocolMessage {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut parsed = None;
@@ -1364,7 +1561,7 @@ mod tests {
     ) -> (
         Subscriber,
         RecordedCalls,
-        tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+        tokio::sync::mpsc::Receiver<ProtocolMessage>,
     ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let rpc = ProgressionRpc {
@@ -1372,7 +1569,8 @@ mod tests {
             blocks: Mutex::new(VecDeque::from(blocks)),
             calls: Arc::clone(&calls),
         };
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
+        let (parser_jobs, parser_inbox) = super::parser_channel();
         let subscriber = Subscriber {
             latest_slot: cursor,
             chain_url: format!("http://127.0.0.1/?api-key={RPC_SECRET}"),
@@ -1381,7 +1579,9 @@ mod tests {
                 RpcClientConfig::with_commitment(CommitmentConfig::finalized()),
             ),
             rpc_block_config: block_config(),
-            unbounded_sender: sender,
+            handler_sender: sender,
+            parser_jobs,
+            parser_inbox: Some(parser_inbox),
             outcome_tx: None,
             outcome_rx: None,
         };
@@ -1424,7 +1624,8 @@ mod tests {
                     Err(rpc_failure(-32602, secret_failure.clone())),
                 ],
             );
-            let (outcome_tx, outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (outcome_tx, outcome_rx) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
             subscriber.set_block_outcomes(outcome_tx.clone(), outcome_rx);
             let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
             let mut seen_tx = Some(seen_tx);
@@ -1433,7 +1634,7 @@ mod tests {
                     match message {
                         ProtocolMessage::ParsedBlock(_, _, _, _) => {
                             outcome_tx
-                                .send(ProtocolMessage::BlockProcessingResult(101, Ok(())))
+                                .try_send(ProtocolMessage::BlockProcessingResult(101, Ok(())))
                                 .expect("outcome");
                             if let Some(sender) = seen_tx.take() {
                                 let _ = sender.send(message);
@@ -1441,7 +1642,7 @@ mod tests {
                         }
                         ProtocolMessage::RecordSkippedSlot(slot) => {
                             outcome_tx
-                                .send(ProtocolMessage::BlockProcessingResult(slot, Ok(())))
+                                .try_send(ProtocolMessage::BlockProcessingResult(slot, Ok(())))
                                 .expect("skipped slot outcome");
                         }
                         _ => {}
@@ -1571,6 +1772,104 @@ mod tests {
         assert_eq!(subscriber.latest_slot, 40);
         assert!(block_requests(&calls.lock().expect("calls")).is_empty());
         assert!(receiver.try_recv().is_err());
+        let recorded = calls.lock().expect("calls");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, RpcRequest::GetSlot);
+        let params = recorded[0].1.as_array().expect("getSlot params");
+        assert_eq!(params[0]["commitment"], "finalized");
+    }
+
+    #[test]
+    fn repeated_block_fetches_reuse_one_rpc_client() {
+        block_on(async {
+            let (client, calls) = scripted_client(vec![
+                Err(rpc_failure(-32602, "first".to_string())),
+                Err(rpc_failure(-32602, "second".to_string())),
+            ]);
+            let (sender, _receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
+            let jobs = super::start_parser_workers();
+            for _ in 0..2 {
+                let outcome = BlockFetcher::request_block(
+                    &client,
+                    7,
+                    block_config(),
+                    sender.clone(),
+                    None,
+                    &jobs,
+                )
+                .await;
+                assert!(matches!(outcome, BlockFetch::Failed(_)));
+            }
+            assert_eq!(block_requests(&calls.lock().expect("calls")), vec![7, 7]);
+        });
+    }
+
+    #[test]
+    fn parser_concurrency_stays_within_four_workers() {
+        block_on(async {
+            use std::sync::atomic::Ordering;
+            super::PARSER_GATE.hold.store(true, Ordering::SeqCst);
+            super::PARSER_GATE.in_flight.store(0, Ordering::SeqCst);
+            super::PARSER_GATE.max_in_flight.store(0, Ordering::SeqCst);
+            super::PARSER_GATE.completed.store(0, Ordering::SeqCst);
+            let (mut subscriber, _calls, _receiver) = progression_subscriber(1, 1, Vec::new());
+            let _ = subscriber.advance_once().await;
+            let jobs = subscriber.parser_jobs.clone();
+            let handler = subscriber.handler_sender.clone();
+            let mut queued = Vec::new();
+            for index in 0..9 {
+                let jobs = jobs.clone();
+                let handler_sender = handler.clone();
+                queued.push(tokio::spawn(async move {
+                    jobs.send(super::ParseJob {
+                        fetch_slot: 2,
+                        block_no: 2,
+                        chunk_index: index,
+                        total_chunks: 9,
+                        transactions: Vec::new(),
+                        handler_sender,
+                        outcome_sender: None,
+                    })
+                    .await
+                    .expect("queue parse job");
+                }));
+            }
+            let started = tokio::time::timeout(Duration::from_secs(2), async {
+                while super::PARSER_GATE.in_flight.load(Ordering::SeqCst)
+                    < super::PARSER_CONCURRENCY
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(started.is_ok(), "parser workers did not start");
+            assert_eq!(
+                super::PARSER_GATE.max_in_flight.load(Ordering::SeqCst),
+                super::PARSER_CONCURRENCY
+            );
+            let queued_immediately = queued.iter().filter(|task| task.is_finished()).count();
+            assert!(
+                queued_immediately < 9,
+                "the extra chunk was accepted without waiting"
+            );
+            super::PARSER_GATE.hold.store(false, Ordering::SeqCst);
+            super::PARSER_GATE.release.notify_waiters();
+            for task in queued {
+                task.await.expect("parse job queued");
+            }
+            let finished = tokio::time::timeout(Duration::from_secs(2), async {
+                while super::PARSER_GATE.completed.load(Ordering::SeqCst) < 9 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(finished.is_ok(), "parser jobs did not finish");
+            assert_eq!(
+                super::PARSER_GATE.max_in_flight.load(Ordering::SeqCst),
+                super::PARSER_CONCURRENCY
+            );
+        });
     }
 
     #[test]
@@ -1579,7 +1878,8 @@ mod tests {
         block_on(async {
             let (mut subscriber, calls, _receiver) =
                 progression_subscriber(100, 110, vec![Ok(confirmed_block(transaction))]);
-            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (outcome_sender, outcome_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
             drop(outcome_sender);
             subscriber.outcome_rx = Some(outcome_receiver);
             assert!(matches!(
@@ -1601,7 +1901,8 @@ mod tests {
                 110,
                 vec![Ok(confirmed_block(first)), Ok(confirmed_block(second))],
             );
-            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (outcome_sender, outcome_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
             subscriber.set_block_outcomes(outcome_sender.clone(), outcome_receiver);
             tokio::spawn(async move {
                 let mut parsed = 0;
@@ -1610,7 +1911,7 @@ mod tests {
                         parsed += 1;
                         let acknowledged_slot = 101;
                         outcome_sender
-                            .send(ProtocolMessage::BlockProcessingResult(
+                            .try_send(ProtocolMessage::BlockProcessingResult(
                                 acknowledged_slot,
                                 Ok(()),
                             ))
@@ -1648,9 +1949,12 @@ mod tests {
             solana_transaction_status::TransactionBinaryEncoding::Base64,
         );
         block_on(async {
-            let (handler_sender, handler_receiver) = tokio::sync::mpsc::unbounded_channel();
-            let (db_sender, mut db_receiver) = tokio::sync::mpsc::unbounded_channel();
-            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (handler_sender, handler_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
+            let (db_sender, mut db_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
+            let (outcome_sender, outcome_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
             let mut handler = crate::handler::Handler::initialize(handler_receiver, db_sender);
             handler.set_block_outcomes(outcome_sender.clone());
             tokio::spawn(async move {
@@ -1658,7 +1962,7 @@ mod tests {
             });
             let (mut subscriber, calls, _receiver) =
                 progression_subscriber(100, 110, vec![Ok(confirmed_block(transaction))]);
-            subscriber.unbounded_sender = handler_sender;
+            subscriber.handler_sender = handler_sender;
             subscriber.set_block_outcomes(outcome_sender, outcome_receiver);
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(2), subscriber.advance_once()).await,
@@ -1681,13 +1985,14 @@ mod tests {
                     "Slot 101 was skipped".to_string(),
                 ))],
             );
-            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (outcome_sender, outcome_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
             subscriber.set_block_outcomes(outcome_sender.clone(), outcome_receiver);
             tokio::spawn(async move {
                 while let Some(message) = receiver.recv().await {
                     if let ProtocolMessage::RecordSkippedSlot(slot) = message {
                         outcome_sender
-                            .send(ProtocolMessage::BlockProcessingResult(
+                            .try_send(ProtocolMessage::BlockProcessingResult(
                                 slot,
                                 Err("checkpoint write failed".to_string()),
                             ))
@@ -1740,14 +2045,15 @@ mod tests {
             .expect("empty block");
             let (mut subscriber, calls, mut receiver) =
                 progression_subscriber(100, 110, vec![Ok(value)]);
-            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (outcome_sender, outcome_receiver) =
+                tokio::sync::mpsc::channel(crate::util::TEST_CHANNEL_CAPACITY);
             subscriber.set_block_outcomes(outcome_sender.clone(), outcome_receiver);
             tokio::spawn(async move {
                 while let Some(message) = receiver.recv().await {
                     if let ProtocolMessage::StoreEmptyBlock(height, slot) = message {
                         assert_eq!((height, slot), (7, 101));
                         outcome_sender
-                            .send(ProtocolMessage::BlockProcessingResult(slot, Ok(())))
+                            .try_send(ProtocolMessage::BlockProcessingResult(slot, Ok(())))
                             .expect("outcome");
                         break;
                     }

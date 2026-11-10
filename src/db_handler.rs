@@ -3,7 +3,7 @@ use crate::util::{Block, ProtocolMessage, QueryFailureKind, MAX_API_BLOCK_RANGE}
 use log::error;
 use serde_json::{from_slice, to_vec};
 use std::collections::{BTreeMap, BTreeSet};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 const LATEST_BLOCK_NO_KEY: &str = "lst_blk_no";
 const CHECKPOINT_KEY: &str = "last_processed_slot";
@@ -49,8 +49,8 @@ fn store_failure(failure: StoreFailure) -> AggError {
 
 pub struct RocksDb {
     db: rocksdb::DB,
-    receiver: UnboundedReceiver<ProtocolMessage>,
-    outcome_sender: Option<UnboundedSender<ProtocolMessage>>,
+    receiver: Receiver<ProtocolMessage>,
+    outcome_sender: Option<Sender<ProtocolMessage>>,
     temp_db: BTreeSet<u64>,
     fail_next_write: bool,
     fail_next_serialization: bool,
@@ -63,15 +63,12 @@ impl RocksDb {
     /// # Arguments
     ///
     /// * `path` - A string slice that holds the path to the database
-    /// * `receiver` - A UnboundedReceiver<ProtocolMessage> that holds the receiver
+    /// * `receiver` - A Receiver<ProtocolMessage> that holds the receiver
     ///
     /// # Returns
     ///
     /// * `Result<Self, AggError>` - A Result that holds the RocksDb client or an error
-    pub fn initialize(
-        path: String,
-        receiver: UnboundedReceiver<ProtocolMessage>,
-    ) -> Result<Self, AggError> {
+    pub fn initialize(path: String, receiver: Receiver<ProtocolMessage>) -> Result<Self, AggError> {
         let db = rocksdb::DB::open_default(&path)?;
         let mut database = Self {
             db,
@@ -126,7 +123,7 @@ impl RocksDb {
             .map_err(|err| err.to_string())
     }
 
-    pub fn set_block_outcomes(&mut self, sender: UnboundedSender<ProtocolMessage>) {
+    pub fn set_block_outcomes(&mut self, sender: Sender<ProtocolMessage>) {
         self.outcome_sender = Some(sender);
     }
 
@@ -141,71 +138,82 @@ impl RocksDb {
     }
 
     /// This function runs the RocksDb client
-    pub(crate) async fn run(&mut self) {
+    pub(crate) async fn run(mut self) {
         loop {
-            if let Some(message) = self.receiver.recv().await {
-                match message {
-                    ProtocolMessage::FinalizeBlock(block_no, block, fetch_slot) => {
-                        println!(
-                            "here block no {:?} {:?}",
-                            block_no,
-                            block.get_tx_hash().len()
-                        );
-                        let result = self.handle_block(block_no, block, fetch_slot);
-                        if let Err(err) = &result {
-                            error!(target: "db", "Error from handle_block {}", err);
-                        }
-                        self.report_block(fetch_slot, result);
-                    }
-                    ProtocolMessage::RecordSkippedSlot(fetch_slot) => {
-                        let result = self.record_skipped_slot(fetch_slot).map_err(store_failure);
-                        if let Err(err) = &result {
-                            error!(target: "db", "Error recording skipped slot {}", err);
-                        }
-                        self.report_block(fetch_slot, result);
-                    }
-                    ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
-                        println!("Fetching tx details {:?}", tx_id);
-                        if let Err(error) = self.handle_tx_request(tx_id, server_sender.clone()) {
-                            Self::handle_error(server_sender, error);
-                        }
-                    }
-                    ProtocolMessage::FetchBlockDetails(block_no, server_sender) => {
-                        println!("Fetching block details {:?}", block_no);
-                        if let Err(error) =
-                            self.handle_block_request(block_no, server_sender.clone())
-                        {
-                            Self::handle_error(server_sender, error);
-                        }
-                    }
-                    ProtocolMessage::FetchLatestBlock(server_sender) => {
-                        println!("Fetching latest block");
-                        if let Err(error) = self.handle_latest_block_request(server_sender.clone())
-                        {
-                            Self::handle_error(server_sender, error);
-                        }
-                    }
-                    ProtocolMessage::FetchBlockRange(start, end, server_sender) => {
-                        println!("Fetching block range");
-                        if let Err(error) =
-                            self.handle_block_range_request(start, end, server_sender.clone())
-                        {
-                            Self::handle_error(server_sender, error);
-                        }
-                    }
-                    ProtocolMessage::FetchAccountBalance(pubkey, block_no, server_sender) => {
-                        println!("Fetching account balance");
-                        if let Err(error) = self.handle_account_balance_request(
-                            pubkey,
-                            block_no,
-                            server_sender.clone(),
-                        ) {
-                            Self::handle_error(server_sender, error);
-                        }
-                    }
-                    _ => {}
+            let Some(message) = self.receiver.recv().await else {
+                return;
+            };
+            self = match tokio::task::spawn_blocking(move || {
+                self.handle_incoming(message);
+                self
+            })
+            .await
+            {
+                Ok(database) => database,
+                Err(error) => {
+                    error!(target: "db", "Database worker stopped: {error}");
+                    return;
+                }
+            };
+        }
+    }
+
+    fn handle_incoming(&mut self, message: ProtocolMessage) {
+        match message {
+            ProtocolMessage::FinalizeBlock(block_no, block, fetch_slot) => {
+                println!(
+                    "here block no {:?} {:?}",
+                    block_no,
+                    block.get_tx_hash().len()
+                );
+                let result = self.handle_block(block_no, block, fetch_slot);
+                if let Err(err) = &result {
+                    error!(target: "db", "Error from handle_block {}", err);
+                }
+                self.report_block(fetch_slot, result);
+            }
+            ProtocolMessage::RecordSkippedSlot(fetch_slot) => {
+                let result = self.record_skipped_slot(fetch_slot).map_err(store_failure);
+                if let Err(err) = &result {
+                    error!(target: "db", "Error recording skipped slot {}", err);
+                }
+                self.report_block(fetch_slot, result);
+            }
+            ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
+                println!("Fetching tx details {:?}", tx_id);
+                if let Err(error) = self.handle_tx_request(tx_id, server_sender.clone()) {
+                    Self::handle_error(server_sender, error);
                 }
             }
+            ProtocolMessage::FetchBlockDetails(block_no, server_sender) => {
+                println!("Fetching block details {:?}", block_no);
+                if let Err(error) = self.handle_block_request(block_no, server_sender.clone()) {
+                    Self::handle_error(server_sender, error);
+                }
+            }
+            ProtocolMessage::FetchLatestBlock(server_sender) => {
+                println!("Fetching latest block");
+                if let Err(error) = self.handle_latest_block_request(server_sender.clone()) {
+                    Self::handle_error(server_sender, error);
+                }
+            }
+            ProtocolMessage::FetchBlockRange(start, end, server_sender) => {
+                println!("Fetching block range");
+                if let Err(error) =
+                    self.handle_block_range_request(start, end, server_sender.clone())
+                {
+                    Self::handle_error(server_sender, error);
+                }
+            }
+            ProtocolMessage::FetchAccountBalance(pubkey, block_no, server_sender) => {
+                println!("Fetching account balance");
+                if let Err(error) =
+                    self.handle_account_balance_request(pubkey, block_no, server_sender.clone())
+                {
+                    Self::handle_error(server_sender, error);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -215,7 +223,7 @@ impl RocksDb {
     ///
     /// * `pubkey` - A string slice that holds the public key
     /// * `block_no` - An Option<u64> that holds the block number
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
@@ -224,7 +232,7 @@ impl RocksDb {
         &self,
         pubkey: String,
         block_no: Option<u64>,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) -> Result<(), AggError> {
         let block_no = match block_no {
             Some(block_no) => block_no,
@@ -240,7 +248,7 @@ impl RocksDb {
             return Err(AggError::AccountNotFound);
         };
         server_sender
-            .send(ProtocolMessage::AccountBalance(balance))
+            .try_send(ProtocolMessage::AccountBalance(balance))
             .map_err(|_| AggError::OneshotChannelError)?;
         Ok(())
     }
@@ -251,7 +259,7 @@ impl RocksDb {
     ///
     /// * `start` - A u64 that holds the start block number
     /// * `end` - A u64 that holds the end block number
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
@@ -260,7 +268,7 @@ impl RocksDb {
         &self,
         start: u64,
         end: u64,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) -> Result<(), AggError> {
         let mut blocks = BTreeMap::new();
         for block_no in bounded_block_range(start, end)? {
@@ -270,7 +278,7 @@ impl RocksDb {
             }
         }
         server_sender
-            .send(ProtocolMessage::BlockRangeDetails(blocks))
+            .try_send(ProtocolMessage::BlockRangeDetails(blocks))
             .map_err(|_| AggError::OneshotChannelError)?;
         Ok(())
     }
@@ -279,14 +287,14 @@ impl RocksDb {
     ///
     /// # Arguments
     ///
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
     fn handle_latest_block_request(
         &self,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) -> Result<(), AggError> {
         let Some(block_no) = self.read_latest_block_number()? else {
             return Err(AggError::NoBlockFinalised);
@@ -296,7 +304,7 @@ impl RocksDb {
         };
         let block = from_slice::<Block>(&bytes)?;
         server_sender
-            .send(ProtocolMessage::LatestBlockDetails(block_no, block))
+            .try_send(ProtocolMessage::LatestBlockDetails(block_no, block))
             .map_err(|_| AggError::OneshotChannelError)?;
         Ok(())
     }
@@ -306,7 +314,7 @@ impl RocksDb {
     /// # Arguments
     ///
     /// * `block_no` - A string slice that holds the block number
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
@@ -314,12 +322,12 @@ impl RocksDb {
     fn handle_block_request(
         &self,
         block_no: String,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) -> Result<(), AggError> {
         if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
             let block = from_slice::<Block>(&block)?;
             server_sender
-                .send(ProtocolMessage::BlockDetails(block.clone()))
+                .try_send(ProtocolMessage::BlockDetails(block.clone()))
                 .map_err(|_| AggError::OneshotChannelError)?;
         } else {
             return Err(AggError::BlockNotFound);
@@ -332,7 +340,7 @@ impl RocksDb {
     /// # Arguments
     ///
     /// * `tx_id` - A string slice that holds the transaction id
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
@@ -340,7 +348,7 @@ impl RocksDb {
     fn handle_tx_request(
         &self,
         tx_id: String,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) -> Result<(), AggError> {
         let signature_key = to_vec(&tx_id)?;
         if let Some(block_no) = self.db.get(signature_key)? {
@@ -349,7 +357,7 @@ impl RocksDb {
                 let block = from_slice::<Block>(&block)?;
                 let tx = block.get_tx_details(&tx_id).ok_or(AggError::TxNotFound)?;
                 server_sender
-                    .send(ProtocolMessage::TxDetails(tx.clone()))
+                    .try_send(ProtocolMessage::TxDetails(tx.clone()))
                     .map_err(|_| AggError::OneshotChannelError)?;
             } else {
                 return Err(AggError::BlockNotFound);
@@ -378,7 +386,7 @@ impl RocksDb {
             fetch_slot,
             result.map_err(|err| err.to_string()),
         );
-        if sender.send(message).is_err() {
+        if sender.try_send(message).is_err() {
             error!(target: "db", "Block outcome receiver is closed");
         }
     }
@@ -755,13 +763,13 @@ impl RocksDb {
     ///
     /// # Arguments
     ///
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     /// * `error` - An AggError that holds the error
-    fn handle_error(server_sender: UnboundedSender<ProtocolMessage>, error: AggError) {
+    fn handle_error(server_sender: Sender<ProtocolMessage>, error: AggError) {
         error!(target: "db", "Query failed: {error}");
         let (kind, message) = classify_query_error(&error);
         if server_sender
-            .send(ProtocolMessage::QueryError(kind, message))
+            .try_send(ProtocolMessage::QueryError(kind, message))
             .is_err()
         {
             error!(target: "db", "Failed to send error message");
@@ -838,7 +846,6 @@ mod tests {
         TransactionStatusMeta, UiTransactionEncoding, UiTransactionStatusMeta,
     };
     use std::path::PathBuf;
-    use tokio::sync::mpsc::unbounded_channel;
 
     struct TempDir {
         path: PathBuf,
@@ -913,7 +920,7 @@ mod tests {
     }
 
     fn parse_chunk(transactions: Vec<EncodedTransactionWithStatusMeta>) -> crate::util::Block {
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         block_on(Parser::invoke(ProtocolMessage::new_chuck(
             42,
             0,
@@ -953,7 +960,7 @@ mod tests {
             .clone();
 
         let directory = TempDir::new();
-        let (_db_sender, db_receiver) = unbounded_channel();
+        let (_db_sender, db_receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), db_receiver)
                 .expect("open temporary database");
@@ -962,7 +969,7 @@ mod tests {
             .expect("start boundary");
         database.handle_block(42, block, 42).expect("persist block");
 
-        let (reply_sender, mut reply_receiver) = unbounded_channel();
+        let (reply_sender, mut reply_receiver) = crate::util::test_channel();
         database
             .handle_tx_request(first_signature, reply_sender.clone())
             .expect("load first signature");
@@ -1007,7 +1014,7 @@ mod tests {
             UiTransactionEncoding::Base64,
             &TransactionStatusMeta::default(),
         );
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
             7,
             0,
@@ -1028,7 +1035,7 @@ mod tests {
             meta: None,
             version: None,
         };
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = crate::util::test_channel();
         let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
             8,
             0,
@@ -1044,10 +1051,10 @@ mod tests {
     #[test]
     fn database_write_failure_reports_the_fetch_slot() {
         let dir = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut db = RocksDb::initialize(dir.path.to_string_lossy().to_string(), receiver)
             .expect("database");
-        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
         db.set_block_outcomes(outcome_sender);
         db.establish_initial_checkpoint(3).expect("start boundary");
         db.inject_write_failure();
@@ -1066,10 +1073,10 @@ mod tests {
     #[test]
     fn database_write_success_reports_the_fetch_slot() {
         let dir = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut db = RocksDb::initialize(dir.path.to_string_lossy().to_string(), receiver)
             .expect("database");
-        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
         db.set_block_outcomes(outcome_sender);
         let mut block = crate::util::Block::default();
         block.push_transaction(
@@ -1084,7 +1091,7 @@ mod tests {
             Ok(ProtocolMessage::BlockProcessingResult(15, Ok(())))
         ));
         let signature = solana_signature::Signature::from([4; 64]).to_string();
-        let (server_sender, mut server_receiver) = unbounded_channel();
+        let (server_sender, mut server_receiver) = crate::util::test_channel();
         db.handle_tx_request(signature.clone(), server_sender)
             .expect("signature lookup");
         assert!(matches!(
@@ -1121,9 +1128,9 @@ mod tests {
             .get_account_balance(&first.message.static_account_keys()[0].to_string())
             .expect("payer balance");
         {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = crate::util::test_channel();
             let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
-            let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+            let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
             database.set_block_outcomes(outcome_sender);
             database
                 .establish_initial_checkpoint(8)
@@ -1143,10 +1150,10 @@ mod tests {
                 Some(balance)
             );
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(path, receiver).expect("reopen");
         assert!(database.get_block(42).is_some());
-        let (reply_sender, mut reply_receiver) = unbounded_channel();
+        let (reply_sender, mut reply_receiver) = crate::util::test_channel();
         database
             .handle_tx_request(first_signature, reply_sender.clone())
             .expect("first signature");
@@ -1166,7 +1173,7 @@ mod tests {
     #[test]
     fn repeated_block_is_idempotent_and_a_conflict_writes_nothing() {
         let directory = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
@@ -1200,7 +1207,7 @@ mod tests {
     #[test]
     fn serialization_failure_leaves_the_database_unchanged() {
         let directory = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
@@ -1220,7 +1227,7 @@ mod tests {
     #[test]
     fn fresh_database_records_its_storage_format() {
         let directory = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
             .expect("open");
         let marker = database
@@ -1239,7 +1246,7 @@ mod tests {
             db.put(super::LATEST_BLOCK_NO_KEY, b"1")
                 .expect("legacy key");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let error =
             match RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver) {
                 Ok(_) => panic!("legacy database was opened"),
@@ -1256,7 +1263,7 @@ mod tests {
     #[test]
     fn empty_block_persists_no_transaction_indexes() {
         let directory = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
@@ -1277,14 +1284,14 @@ mod tests {
         let directory = TempDir::new();
         let path = directory.path.to_string_lossy().to_string();
         let checkpoint = {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = crate::util::test_channel();
             let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
             assert_eq!(database.read_checkpoint().expect("read"), None);
             database.establish_initial_checkpoint(80).expect("boundary");
             database.read_checkpoint().expect("read")
         };
         assert_eq!(checkpoint, Some(80));
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(path, receiver).expect("reopen");
         assert_eq!(database.read_checkpoint().expect("read"), Some(80));
     }
@@ -1292,7 +1299,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_gaps_and_does_not_move_backward() {
         let directory = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
@@ -1314,9 +1321,9 @@ mod tests {
         let directory = TempDir::new();
         let path = directory.path.to_string_lossy().to_string();
         {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = crate::util::test_channel();
             let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
-            let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+            let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
             database.set_block_outcomes(outcome_sender);
             database.establish_initial_checkpoint(4).expect("boundary");
             let result = database
@@ -1341,7 +1348,7 @@ mod tests {
             ));
             assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(5));
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(path, receiver).expect("reopen");
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(5));
     }
@@ -1349,7 +1356,7 @@ mod tests {
     #[test]
     fn slot_checkpoint_is_not_inferred_from_block_height() {
         let directory = TempDir::new();
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open");
@@ -1373,7 +1380,7 @@ mod tests {
             .expect("marker");
             db.put(super::LATEST_BLOCK_NO_KEY, b"1").expect("height");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let error =
             match RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver) {
                 Ok(_) => panic!("indexed v1 database was opened"),
@@ -1399,7 +1406,7 @@ mod tests {
             )
             .expect("marker");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
             .expect("upgrade empty v1");
         assert_eq!(
@@ -1418,7 +1425,7 @@ mod tests {
             db.put(super::STORAGE_FORMAT_KEY, b"future-format")
                 .expect("marker");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let error =
             match RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver) {
                 Ok(_) => panic!("unsupported marker was accepted"),
@@ -1437,14 +1444,14 @@ mod tests {
         let directory = TempDir::new();
         let path = directory.path.to_string_lossy().to_string();
         {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = crate::util::test_channel();
             let database = RocksDb::initialize(path.clone(), receiver).expect("open");
             database
                 .db
                 .put(super::CHECKPOINT_KEY, b"not-a-slot")
                 .expect("corrupt checkpoint");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(path, receiver).expect("reopen");
         let error = match database.read_checkpoint() {
             Ok(value) => panic!("corrupt checkpoint returned {value:?}"),
@@ -1461,7 +1468,7 @@ mod tests {
         let directory = TempDir::new();
         let path = directory.path.to_string_lossy().to_string();
         {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = crate::util::test_channel();
             let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
             database.establish_initial_checkpoint(0).expect("boundary");
             database
@@ -1472,7 +1479,7 @@ mod tests {
                 .expect("height 3");
             assert_eq!(database.get_latest_block(), Some(1));
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database = RocksDb::initialize(path, receiver).expect("reopen");
         assert!(database.temp_db.contains(&3));
         database
@@ -1491,14 +1498,14 @@ mod tests {
         let directory = TempDir::new();
         let path = directory.path.to_string_lossy().to_string();
         {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = crate::util::test_channel();
             let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
             database.establish_initial_checkpoint(3).expect("boundary");
             database
                 .handle_block(9, crate::util::Block::default(), 4)
                 .expect("durable batch");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database = RocksDb::initialize(path, receiver).expect("reopen");
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
         assert!(database.get_block(9).is_some());
@@ -1521,7 +1528,7 @@ mod tests {
             .expect("marker");
             db.put(super::LATEST_BLOCK_NO_KEY, b"1").expect("height");
         }
-        let (_sender, receiver) = unbounded_channel();
+        let (_sender, receiver) = crate::util::test_channel();
         let mut database =
             RocksDb::initialize(directory.path.to_string_lossy().to_string(), receiver)
                 .expect("open existing v2 data");

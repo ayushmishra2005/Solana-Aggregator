@@ -3,19 +3,19 @@ use crate::db_handler::RocksDb;
 use crate::error::AggError;
 use crate::handler::Handler;
 use crate::util::ProtocolMessage;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 pub struct SourceChain(String);
 pub struct NoSourceChain;
 pub struct DbPath(String);
 pub struct NoDbPath;
-pub struct DbSender(UnboundedSender<ProtocolMessage>);
+pub struct DbSender(Sender<ProtocolMessage>);
 pub struct NoDbSender;
-pub struct DbReceiver(UnboundedReceiver<ProtocolMessage>);
+pub struct DbReceiver(Receiver<ProtocolMessage>);
 pub struct NoDbReceiver;
-pub struct HandlerSender(UnboundedSender<ProtocolMessage>);
+pub struct HandlerSender(Sender<ProtocolMessage>);
 pub struct NoHandlerSender;
-pub struct HandlerReceiver(UnboundedReceiver<ProtocolMessage>);
+pub struct HandlerReceiver(Receiver<ProtocolMessage>);
 pub struct NoHandlerReceiver;
 
 pub struct Builder<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver> {
@@ -102,14 +102,14 @@ impl<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver>
     ///
     /// # Arguments
     ///
-    /// * `db_sender` - A UnboundedSender<ProtocolMessage> that holds the db sender
+    /// * `db_sender` - A Sender<ProtocolMessage> that holds the db sender
     ///
     /// # Returns
     ///
     /// * `Builder<...>` - A Builder that holds the db sender
     pub fn db_sender(
         self,
-        db_sender: UnboundedSender<ProtocolMessage>,
+        db_sender: Sender<ProtocolMessage>,
     ) -> Builder<ChainUrl, DBPath, DbSender, DBReceiver, RouterSender, RouterReceiver> {
         Builder {
             chain_url: self.chain_url,
@@ -125,10 +125,10 @@ impl<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver>
     ///
     /// # Arguments
     ///
-    /// * `db_receiver` - A UnboundedReceiver<ProtocolMessage> that holds the db receiver
+    /// * `db_receiver` - A Receiver<ProtocolMessage> that holds the db receiver
     pub fn db_receiver(
         self,
-        db_receiver: UnboundedReceiver<ProtocolMessage>,
+        db_receiver: Receiver<ProtocolMessage>,
     ) -> Builder<ChainUrl, DBPath, DBSender, DbReceiver, RouterSender, RouterReceiver> {
         Builder {
             chain_url: self.chain_url,
@@ -144,14 +144,14 @@ impl<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver>
     ///
     /// # Arguments
     ///
-    /// * `router_sender` - A UnboundedSender<ProtocolMessage> that holds the router sender
+    /// * `router_sender` - A Sender<ProtocolMessage> that holds the router sender
     ///
     /// # Returns
     ///
     /// * `Builder<...>` - A Builder that holds the router sender
     pub fn router_sender(
         self,
-        router_sender: UnboundedSender<ProtocolMessage>,
+        router_sender: Sender<ProtocolMessage>,
     ) -> Builder<ChainUrl, DBPath, DBSender, DBReceiver, HandlerSender, RouterReceiver> {
         Builder {
             chain_url: self.chain_url,
@@ -167,14 +167,14 @@ impl<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver>
     ///
     /// # Arguments
     ///
-    /// * `router_receiver` - A UnboundedReceiver<ProtocolMessage> that holds the router receiver
+    /// * `router_receiver` - A Receiver<ProtocolMessage> that holds the router receiver
     ///
     /// # Returns
     ///
     /// * `Builder<...>` - A Builder that holds the router receiver
     pub fn router_receiver(
         self,
-        router_receiver: UnboundedReceiver<ProtocolMessage>,
+        router_receiver: Receiver<ProtocolMessage>,
     ) -> Builder<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, HandlerReceiver> {
         Builder {
             chain_url: self.chain_url,
@@ -188,8 +188,8 @@ impl<ChainUrl, DBPath, DBSender, DBReceiver, RouterSender, RouterReceiver>
 }
 
 impl Builder<SourceChain, NoDbPath, NoDbSender, NoDbReceiver, HandlerSender, NoHandlerReceiver> {
-    pub fn build(self) -> Result<Subscriber, AggError> {
-        Subscriber::initialize(self.chain_url.0, self.router_sender.0)
+    pub async fn build(self) -> Result<Subscriber, AggError> {
+        Subscriber::initialize(self.chain_url.0, self.router_sender.0).await
     }
 }
 

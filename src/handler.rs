@@ -3,7 +3,7 @@ use crate::util::{Block, ChunkReject, ProtocolMessage, QueryFailureKind, Unproce
 use log::error;
 use solana_clock::Slot;
 use std::collections::{HashMap, HashSet, VecDeque};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 const TERMINAL_BLOCK_LIMIT: usize = 1024;
 
@@ -13,9 +13,9 @@ struct PartialBlock {
 }
 
 pub struct Handler {
-    message_receiver: UnboundedReceiver<ProtocolMessage>,
-    db_sender: UnboundedSender<ProtocolMessage>,
-    outcome_sender: Option<UnboundedSender<ProtocolMessage>>,
+    message_receiver: Receiver<ProtocolMessage>,
+    db_sender: Sender<ProtocolMessage>,
+    outcome_sender: Option<Sender<ProtocolMessage>>,
     unprocessed_block_collector: HashMap<Slot, PartialBlock>,
     fetch_slots: HashMap<Slot, u64>,
     terminal_blocks: HashSet<Slot>,
@@ -28,15 +28,15 @@ impl Handler {
     ///
     /// # Arguments
     ///
-    /// * `message_receiver` - A UnboundedReceiver<ProtocolMessage> that holds the message receiver
-    /// * `db_sender` - A UnboundedSender<ProtocolMessage> that holds the db sender
+    /// * `message_receiver` - A Receiver<ProtocolMessage> that holds the message receiver
+    /// * `db_sender` - A Sender<ProtocolMessage> that holds the db sender
     ///
     /// # Returns
     ///
     /// * `Self` - The handler
     pub fn initialize(
-        message_receiver: UnboundedReceiver<ProtocolMessage>,
-        db_sender: UnboundedSender<ProtocolMessage>,
+        message_receiver: Receiver<ProtocolMessage>,
+        db_sender: Sender<ProtocolMessage>,
     ) -> Self {
         Self {
             message_receiver,
@@ -49,7 +49,7 @@ impl Handler {
         }
     }
 
-    pub fn set_block_outcomes(&mut self, sender: UnboundedSender<ProtocolMessage>) {
+    pub fn set_block_outcomes(&mut self, sender: Sender<ProtocolMessage>) {
         self.outcome_sender = Some(sender);
     }
 
@@ -66,6 +66,7 @@ impl Handler {
                         if self
                             .db_sender
                             .send(ProtocolMessage::RecordSkippedSlot(fetch_slot))
+                            .await
                             .is_err()
                         {
                             self.report(fetch_slot, Err("database channel closed".to_string()));
@@ -79,6 +80,7 @@ impl Handler {
                                 Block::default(),
                                 fetch_slot,
                             ))
+                            .await
                             .is_err()
                         {
                             self.report(fetch_slot, Err("database channel closed".to_string()));
@@ -95,19 +97,21 @@ impl Handler {
                         }
                     }
                     ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
-                        self.handle_tx_details(tx_id, server_sender);
+                        self.handle_tx_details(tx_id, server_sender).await;
                     }
                     ProtocolMessage::FetchBlockDetails(block_no, server_sender) => {
-                        self.handle_block_details(block_no, server_sender);
+                        self.handle_block_details(block_no, server_sender).await;
                     }
                     ProtocolMessage::FetchLatestBlock(server_sender) => {
-                        self.handle_latest_block_request(server_sender);
+                        self.handle_latest_block_request(server_sender).await;
                     }
                     ProtocolMessage::FetchBlockRange(start, end, server_sender) => {
-                        self.handle_block_range_request(start, end, server_sender);
+                        self.handle_block_range_request(start, end, server_sender)
+                            .await;
                     }
                     ProtocolMessage::FetchAccountBalance(pubkey, block_no, server_sender) => {
-                        self.handle_account_balance(pubkey, block_no, server_sender);
+                        self.handle_account_balance(pubkey, block_no, server_sender)
+                            .await;
                     }
 
                     _ => {}
@@ -172,11 +176,13 @@ impl Handler {
                 let fetch_slot = partial.fetch_slot;
                 self.fetch_slots.remove(&block_no);
                 self.remember_terminal(block_no);
-                self.db_sender.send(ProtocolMessage::FinalizeBlock(
-                    block_no,
-                    complete_block,
-                    fetch_slot,
-                ))?;
+                self.db_sender
+                    .try_send(ProtocolMessage::FinalizeBlock(
+                        block_no,
+                        complete_block,
+                        fetch_slot,
+                    ))
+                    .map_err(|_| AggError::OneshotChannelError)?;
             }
             Ok(_) => {}
             Err(ChunkReject::OutOfRange) => {
@@ -232,7 +238,7 @@ impl Handler {
             return;
         };
         if sender
-            .send(ProtocolMessage::BlockProcessingResult(fetch_slot, result))
+            .try_send(ProtocolMessage::BlockProcessingResult(fetch_slot, result))
             .is_err()
         {
             error!(target: "handler", "Block outcome receiver is closed");
@@ -249,20 +255,21 @@ impl Handler {
     /// # Arguments
     ///
     /// * `tx_id` - A String that holds the transaction id
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
-    pub fn handle_tx_details(
+    pub async fn handle_tx_details(
         &mut self,
         tx_id: String,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) {
         self.forward_to_database(ProtocolMessage::FetchTransactionDetails(
             tx_id,
             server_sender,
-        ));
+        ))
+        .await;
     }
 
     /// This function handles the block details
@@ -270,17 +277,18 @@ impl Handler {
     /// # Arguments
     ///
     /// * `block_no` - A String that holds the block number
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
-    pub fn handle_block_details(
+    pub async fn handle_block_details(
         &mut self,
         block_no: String,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) {
-        self.forward_to_database(ProtocolMessage::FetchBlockDetails(block_no, server_sender));
+        self.forward_to_database(ProtocolMessage::FetchBlockDetails(block_no, server_sender))
+            .await;
     }
 
     /// This function handles the account balance
@@ -289,31 +297,33 @@ impl Handler {
     ///
     /// * `pubkey` - A String that holds the public key
     /// * `block_no` - An Option<u64> that holds the block number
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
-    pub fn handle_account_balance(
+    pub async fn handle_account_balance(
         &mut self,
         pubkey: String,
         block_no: Option<u64>,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) {
         self.forward_to_database(ProtocolMessage::FetchAccountBalance(
             pubkey,
             block_no,
             server_sender,
-        ));
+        ))
+        .await;
     }
 
     /// This function handles the latest block request
     ///
     /// # Arguments
     ///
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
-    pub fn handle_latest_block_request(&mut self, server_sender: UnboundedSender<ProtocolMessage>) {
-        self.forward_to_database(ProtocolMessage::FetchLatestBlock(server_sender));
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
+    pub async fn handle_latest_block_request(&mut self, server_sender: Sender<ProtocolMessage>) {
+        self.forward_to_database(ProtocolMessage::FetchLatestBlock(server_sender))
+            .await;
     }
 
     /// This function handles the block range request
@@ -322,33 +332,36 @@ impl Handler {
     ///
     /// * `start` - A u64 that holds the start
     /// * `end` - A u64 that holds the end
-    /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
+    /// * `server_sender` - A Sender<ProtocolMessage> that holds the server sender
     ///
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
-    pub fn handle_block_range_request(
+    pub async fn handle_block_range_request(
         &mut self,
         start: u64,
         end: u64,
-        server_sender: UnboundedSender<ProtocolMessage>,
+        server_sender: Sender<ProtocolMessage>,
     ) {
-        self.forward_to_database(ProtocolMessage::FetchBlockRange(start, end, server_sender));
+        self.forward_to_database(ProtocolMessage::FetchBlockRange(start, end, server_sender))
+            .await;
     }
 
-    fn forward_to_database(&self, message: ProtocolMessage) {
-        if let Err(send_error) = self.db_sender.send(message) {
+    async fn forward_to_database(&self, message: ProtocolMessage) {
+        if let Err(send_error) = self.db_sender.send(message).await {
             if let Some(reply) = detach_query_reply(send_error.0) {
-                let _ = reply.send(ProtocolMessage::QueryError(
-                    QueryFailureKind::Unavailable,
-                    "Database worker is unavailable",
-                ));
+                let _ = reply
+                    .send(ProtocolMessage::QueryError(
+                        QueryFailureKind::Unavailable,
+                        "Database worker is unavailable",
+                    ))
+                    .await;
             }
         }
     }
 }
 
-fn detach_query_reply(message: ProtocolMessage) -> Option<UnboundedSender<ProtocolMessage>> {
+fn detach_query_reply(message: ProtocolMessage) -> Option<Sender<ProtocolMessage>> {
     match message {
         ProtocolMessage::FetchTransactionDetails(_, reply)
         | ProtocolMessage::FetchBlockDetails(_, reply)
@@ -363,12 +376,11 @@ fn detach_query_reply(message: ProtocolMessage) -> Option<UnboundedSender<Protoc
 mod tests {
     use super::Handler;
     use crate::util::{Block, ProtocolMessage};
-    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
     fn duplicate_chunk_finalizes_a_completed_block_only_once() {
-        let (_incoming_sender, incoming) = unbounded_channel();
-        let (db_sender, mut db_receiver) = unbounded_channel();
+        let (_incoming_sender, incoming) = crate::util::test_channel();
+        let (db_sender, mut db_receiver) = crate::util::test_channel();
         let mut handler = Handler::initialize(incoming, db_sender);
         let chunk = Block::default();
 
@@ -389,8 +401,8 @@ mod tests {
 
     #[test]
     fn out_of_order_chunks_finalize_once_and_clear_state() {
-        let (_incoming_sender, incoming) = unbounded_channel();
-        let (db_sender, mut db_receiver) = unbounded_channel();
+        let (_incoming_sender, incoming) = crate::util::test_channel();
+        let (db_sender, mut db_receiver) = crate::util::test_channel();
         let mut handler = Handler::initialize(incoming, db_sender);
         handler
             .handle_unprocessed_block(4, 2, 1, Block::default())
@@ -416,9 +428,9 @@ mod tests {
 
     #[test]
     fn conflicting_and_invalid_chunks_fail_without_finalizing() {
-        let (_incoming_sender, incoming) = unbounded_channel();
-        let (db_sender, mut db_receiver) = unbounded_channel();
-        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        let (_incoming_sender, incoming) = crate::util::test_channel();
+        let (db_sender, mut db_receiver) = crate::util::test_channel();
+        let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
         let mut handler = Handler::initialize(incoming, db_sender);
         handler.set_block_outcomes(outcome_sender);
         handler
@@ -459,8 +471,8 @@ mod tests {
 
     #[test]
     fn incomplete_block_does_not_finalize() {
-        let (_incoming_sender, incoming) = unbounded_channel();
-        let (db_sender, mut db_receiver) = unbounded_channel();
+        let (_incoming_sender, incoming) = crate::util::test_channel();
+        let (db_sender, mut db_receiver) = crate::util::test_channel();
         let mut handler = Handler::initialize(incoming, db_sender);
         handler
             .handle_unprocessed_block(3, 2, 0, Block::default())
@@ -471,9 +483,9 @@ mod tests {
 
     #[test]
     fn parser_chunk_failure_prevents_completion() {
-        let (_incoming_sender, incoming) = unbounded_channel();
-        let (db_sender, mut db_receiver) = unbounded_channel();
-        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        let (_incoming_sender, incoming) = crate::util::test_channel();
+        let (db_sender, mut db_receiver) = crate::util::test_channel();
+        let (outcome_sender, mut outcome_receiver) = crate::util::test_channel();
         let mut handler = Handler::initialize(incoming, db_sender);
         handler.set_block_outcomes(outcome_sender);
         handler

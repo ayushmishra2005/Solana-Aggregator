@@ -4,7 +4,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction_status::{EncodedTransactionWithStatusMeta, UiTransactionStatusMeta};
 use std::collections::{BTreeMap, HashMap};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 type SlotNo = u64;
 type ChunkNo = u64;
@@ -12,6 +12,19 @@ type TotalChunk = u64;
 
 /// Inclusive block-height span accepted by `GET /block_range/{start}/{end}`.
 pub const MAX_API_BLOCK_RANGE: u64 = 100;
+/// Chunks of one block that may be parsed at the same time.
+pub const PARSER_CONCURRENCY: usize = 4;
+/// Pending messages from the subscriber, parsers, and HTTP handlers.
+pub const HANDLER_CHANNEL_CAPACITY: usize = 16;
+/// Pending writes and HTTP reads for the database worker.
+pub const DATABASE_CHANNEL_CAPACITY: usize = 16;
+/// Slot acknowledgments waiting for the subscriber.
+pub const OUTCOME_CHANNEL_CAPACITY: usize = 8;
+/// One reply, with a little room so the sender does not race the receiver.
+pub const REPLY_CHANNEL_CAPACITY: usize = 4;
+/// Capacity used by tests that queue a handful of protocol messages.
+#[cfg(test)]
+pub const TEST_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryFailureKind {
@@ -24,25 +37,25 @@ pub enum QueryFailureKind {
 
 #[derive(Debug)]
 pub enum ProtocolMessage {
-    FetchBlock(String, RpcBlockConfig, SlotNo, UnboundedSender<Self>),
+    FetchBlock(String, RpcBlockConfig, SlotNo, Sender<Self>),
     NewChuck(
         SlotNo,
         ChunkNo,
         TotalChunk,
         Vec<EncodedTransactionWithStatusMeta>,
-        UnboundedSender<Self>,
+        Sender<Self>,
     ),
     ParsedBlock(SlotNo, TotalChunk, ChunkNo, Block),
     FinalizeBlock(SlotNo, Block, SlotNo),
-    FetchTransactionDetails(String, UnboundedSender<Self>),
+    FetchTransactionDetails(String, Sender<Self>),
     TxDetails(TxRecord),
-    FetchBlockDetails(String, UnboundedSender<Self>),
-    FetchLatestBlock(UnboundedSender<Self>),
+    FetchBlockDetails(String, Sender<Self>),
+    FetchLatestBlock(Sender<Self>),
     LatestBlockDetails(u64, Block),
     BlockDetails(Block),
-    FetchBlockRange(u64, u64, UnboundedSender<Self>),
+    FetchBlockRange(u64, u64, Sender<Self>),
     BlockRangeDetails(BTreeMap<u64, Block>),
-    FetchAccountBalance(String, Option<u64>, UnboundedSender<Self>),
+    FetchAccountBalance(String, Option<u64>, Sender<Self>),
     AccountBalance(u64),
     /// Classified query failure. The text is a fixed client-safe message.
     QueryError(QueryFailureKind, &'static str),
@@ -64,7 +77,7 @@ impl ProtocolMessage {
         chunk_no: ChunkNo,
         total_chunks: u64,
         txs: Vec<EncodedTransactionWithStatusMeta>,
-        sender: UnboundedSender<Self>,
+        sender: Sender<Self>,
     ) -> Self {
         ProtocolMessage::NewChuck(slot, chunk_no, total_chunks, txs, sender)
     }
@@ -73,7 +86,7 @@ impl ProtocolMessage {
         client_url: String,
         rpc_block_config: RpcBlockConfig,
         slot: SlotNo,
-        sender: UnboundedSender<ProtocolMessage>,
+        sender: Sender<ProtocolMessage>,
     ) -> Self {
         ProtocolMessage::FetchBlock(client_url, rpc_block_config, slot, sender)
     }
@@ -223,19 +236,24 @@ impl UnprocessedBlock {
 }
 
 pub struct Channel<T> {
-    sender: UnboundedSender<T>,
-    pub receiver: UnboundedReceiver<T>,
+    sender: Sender<T>,
+    pub receiver: Receiver<T>,
 }
 
 impl<T> Channel<T> {
-    pub fn new() -> Self {
-        let (sender, receiver) = unbounded_channel::<T>();
+    pub fn new(capacity: usize) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         Channel { sender, receiver }
     }
 
-    pub fn sender(&self) -> UnboundedSender<T> {
+    pub fn sender(&self) -> Sender<T> {
         self.sender.clone()
     }
+}
+
+#[cfg(test)]
+pub fn test_channel() -> (Sender<ProtocolMessage>, Receiver<ProtocolMessage>) {
+    tokio::sync::mpsc::channel(TEST_CHANNEL_CAPACITY)
 }
 
 #[derive(Deserialize)]
