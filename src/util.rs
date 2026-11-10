@@ -10,6 +10,18 @@ type SlotNo = u64;
 type ChunkNo = u64;
 type TotalChunk = u64;
 
+/// Inclusive block-height span accepted by `GET /block_range/{start}/{end}`.
+pub const MAX_API_BLOCK_RANGE: u64 = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFailureKind {
+    BadRequest,
+    NotFound,
+    NotReady,
+    Unavailable,
+    Storage,
+}
+
 #[derive(Debug)]
 pub enum ProtocolMessage {
     FetchBlock(String, RpcBlockConfig, SlotNo, UnboundedSender<Self>),
@@ -32,7 +44,8 @@ pub enum ProtocolMessage {
     BlockRangeDetails(BTreeMap<u64, Block>),
     FetchAccountBalance(String, Option<u64>, UnboundedSender<Self>),
     AccountBalance(u64),
-    Error(String),
+    /// Classified query failure. The text is a fixed client-safe message.
+    QueryError(QueryFailureKind, &'static str),
     /// `fetch_slot`, `block_height`, `total_chunks`.
     ExpectBlock(SlotNo, SlotNo, TotalChunk),
     /// `block_height`, `fetch_slot`, sanitized error.
@@ -227,7 +240,7 @@ impl<T> Channel<T> {
 
 #[derive(Deserialize)]
 pub struct QueryParams {
-    pub(crate) block_no: Option<u64>,
+    pub(crate) block_no: Option<String>,
 }
 
 #[cfg(test)]

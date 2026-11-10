@@ -1,5 +1,5 @@
 use crate::error::AggError;
-use crate::util::{Block, ProtocolMessage};
+use crate::util::{Block, ProtocolMessage, QueryFailureKind, MAX_API_BLOCK_RANGE};
 use log::error;
 use serde_json::{from_slice, to_vec};
 use std::collections::{BTreeMap, BTreeSet};
@@ -226,25 +226,22 @@ impl RocksDb {
         block_no: Option<u64>,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) -> Result<(), AggError> {
-        if let Some(block_no) = block_no {
-            if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
-                let block = from_slice::<Block>(&block)?;
-                let balance = block.get_account_balance(&pubkey);
-                server_sender
-                    .send(ProtocolMessage::AccountBalance(balance.unwrap_or_default()))
-                    .map_err(|_| AggError::OneshotChannelError)?;
-            }
-        } else {
-            if let Some(block_no) = self.get_latest_block() {
-                if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
-                    let block = from_slice::<Block>(&block)?;
-                    let balance = block.get_account_balance(&pubkey);
-                    server_sender
-                        .send(ProtocolMessage::AccountBalance(balance.unwrap_or_default()))
-                        .map_err(|_| AggError::OneshotChannelError)?;
-                }
-            }
-        }
+        let block_no = match block_no {
+            Some(block_no) => block_no,
+            None => self
+                .read_latest_block_number()?
+                .ok_or(AggError::NoBlockFinalised)?,
+        };
+        let Some(bytes) = self.db.get(format!("BlockNo{block_no}"))? else {
+            return Err(AggError::BlockNotFound);
+        };
+        let block = from_slice::<Block>(&bytes)?;
+        let Some(balance) = block.get_account_balance(&pubkey) else {
+            return Err(AggError::AccountNotFound);
+        };
+        server_sender
+            .send(ProtocolMessage::AccountBalance(balance))
+            .map_err(|_| AggError::OneshotChannelError)?;
         Ok(())
     }
 
@@ -266,8 +263,8 @@ impl RocksDb {
         server_sender: UnboundedSender<ProtocolMessage>,
     ) -> Result<(), AggError> {
         let mut blocks = BTreeMap::new();
-        for block_no in start..=end {
-            if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
+        for block_no in bounded_block_range(start, end)? {
+            if let Some(block) = self.db.get(format!("BlockNo{block_no}"))? {
                 let block = from_slice::<Block>(&block)?;
                 blocks.insert(block_no, block);
             }
@@ -291,18 +288,16 @@ impl RocksDb {
         &self,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) -> Result<(), AggError> {
-        if let Some(block_no) = self.get_latest_block() {
-            if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
-                let block = from_slice::<Block>(&block)?;
-                server_sender
-                    .send(ProtocolMessage::LatestBlockDetails(block_no, block.clone()))
-                    .map_err(|_| AggError::OneshotChannelError)?;
-            } else {
-                return Err(AggError::BlockNotFound);
-            }
-        } else {
+        let Some(block_no) = self.read_latest_block_number()? else {
             return Err(AggError::NoBlockFinalised);
-        }
+        };
+        let Some(bytes) = self.db.get(format!("BlockNo{block_no}"))? else {
+            return Err(AggError::BlockNotFound);
+        };
+        let block = from_slice::<Block>(&bytes)?;
+        server_sender
+            .send(ProtocolMessage::LatestBlockDetails(block_no, block))
+            .map_err(|_| AggError::OneshotChannelError)?;
         Ok(())
     }
 
@@ -347,7 +342,8 @@ impl RocksDb {
         tx_id: String,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) -> Result<(), AggError> {
-        if let Some(block_no) = self.db.get(to_vec(&tx_id).unwrap())? {
+        let signature_key = to_vec(&tx_id)?;
+        if let Some(block_no) = self.db.get(signature_key)? {
             let block_no = from_slice::<u64>(&block_no)?;
             if let Some(block) = self.db.get(format!("BlockNo{}", block_no))? {
                 let block = from_slice::<Block>(&block)?;
@@ -762,9 +758,64 @@ impl RocksDb {
     /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
     /// * `error` - An AggError that holds the error
     fn handle_error(server_sender: UnboundedSender<ProtocolMessage>, error: AggError) {
-        if let Err(error) = server_sender.send(ProtocolMessage::Error(error.to_string())) {
-            error!(target: "db", "Failed to send error message {:?}", error);
+        error!(target: "db", "Query failed: {error}");
+        let (kind, message) = classify_query_error(&error);
+        if server_sender
+            .send(ProtocolMessage::QueryError(kind, message))
+            .is_err()
+        {
+            error!(target: "db", "Failed to send error message");
         }
+    }
+
+    fn read_latest_block_number(&self) -> Result<Option<u64>, AggError> {
+        match self.db.get(LATEST_BLOCK_NO_KEY)? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(from_slice(&bytes)?)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_test_block(
+        &mut self,
+        block_no: u64,
+        fetch_slot: u64,
+        block: Block,
+    ) -> Result<(), AggError> {
+        self.handle_block(block_no, block, fetch_slot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_block_record(&self, block_no: u64) -> Result<(), rocksdb::Error> {
+        self.db.put(format!("BlockNo{block_no}"), b"not-json")
+    }
+}
+
+fn bounded_block_range(start: u64, end: u64) -> Result<impl Iterator<Item = u64>, AggError> {
+    if start > end {
+        return Err(AggError::InvalidRequest);
+    }
+    let length = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or(AggError::InvalidRequest)?;
+    if length > MAX_API_BLOCK_RANGE {
+        return Err(AggError::InvalidRequest);
+    }
+    Ok(start..=end)
+}
+
+fn classify_query_error(error: &AggError) -> (QueryFailureKind, &'static str) {
+    match error {
+        AggError::BlockNotFound => (QueryFailureKind::NotFound, "Block not found"),
+        AggError::TxNotFound => (QueryFailureKind::NotFound, "Transaction not found"),
+        AggError::AccountNotFound => (QueryFailureKind::NotFound, "Account observation not found"),
+        AggError::NoBlockFinalised => (QueryFailureKind::NotReady, "No block has been indexed yet"),
+        AggError::InvalidRequest => (QueryFailureKind::BadRequest, "Invalid block range"),
+        AggError::DbError(_) | AggError::JsonError(_) => {
+            (QueryFailureKind::Storage, "Internal storage error")
+        }
+        _ => (QueryFailureKind::Storage, "Internal storage error"),
     }
 }
 

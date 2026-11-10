@@ -17,6 +17,8 @@ pub enum AggError {
     BlockNotFound,
     NoBlockFinalised,
     TxNotFound,
+    AccountNotFound,
+    InvalidRequest,
     InvalidTransactionSignature,
     InvalidTransferInstruction,
     InvalidBalanceMetadata,
@@ -40,6 +42,8 @@ impl Display for AggError {
             AggError::BlockNotFound => "Block Not Found".to_string(),
             AggError::NoBlockFinalised => "No Block Finalised".to_string(),
             AggError::TxNotFound => "Transaction Not Found".to_string(),
+            AggError::AccountNotFound => "Account observation not found".to_string(),
+            AggError::InvalidRequest => "Invalid request".to_string(),
             AggError::InvalidTransactionSignature => "Invalid transaction signature".to_string(),
             AggError::InvalidTransferInstruction => {
                 "Invalid system transfer instruction".to_string()
@@ -71,6 +75,8 @@ impl Debug for AggError {
             AggError::BlockNotFound => "Block Not Found".to_string(),
             AggError::NoBlockFinalised => "No Block Finalised".to_string(),
             AggError::TxNotFound => "Transaction Not Found".to_string(),
+            AggError::AccountNotFound => "Account observation not found".to_string(),
+            AggError::InvalidRequest => "Invalid request".to_string(),
             AggError::InvalidTransactionSignature => "Invalid transaction signature".to_string(),
             AggError::InvalidTransferInstruction => {
                 "Invalid system transfer instruction".to_string()

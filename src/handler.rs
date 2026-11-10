@@ -1,5 +1,5 @@
 use crate::error::AggError;
-use crate::util::{Block, ChunkReject, ProtocolMessage, UnprocessedBlock};
+use crate::util::{Block, ChunkReject, ProtocolMessage, QueryFailureKind, UnprocessedBlock};
 use log::error;
 use solana_clock::Slot;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -259,15 +259,10 @@ impl Handler {
         tx_id: String,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) {
-        if let Err(error) = self
-            .db_sender
-            .send(ProtocolMessage::FetchTransactionDetails(
-                tx_id,
-                server_sender,
-            ))
-        {
-            error!(target: "handler", "Error from db_sender {}", error);
-        }
+        self.forward_to_database(ProtocolMessage::FetchTransactionDetails(
+            tx_id,
+            server_sender,
+        ));
     }
 
     /// This function handles the block details
@@ -285,12 +280,7 @@ impl Handler {
         block_no: String,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) {
-        if let Err(err) = self
-            .db_sender
-            .send(ProtocolMessage::FetchBlockDetails(block_no, server_sender))
-        {
-            error!(target: "handler", "Error from db_sender {}", err);
-        }
+        self.forward_to_database(ProtocolMessage::FetchBlockDetails(block_no, server_sender));
     }
 
     /// This function handles the account balance
@@ -310,13 +300,11 @@ impl Handler {
         block_no: Option<u64>,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) {
-        if let Err(err) = self.db_sender.send(ProtocolMessage::FetchAccountBalance(
+        self.forward_to_database(ProtocolMessage::FetchAccountBalance(
             pubkey,
             block_no,
             server_sender,
-        )) {
-            error!(target: "handler", "Error from db_sender {}", err);
-        }
+        ));
     }
 
     /// This function handles the latest block request
@@ -325,12 +313,7 @@ impl Handler {
     ///
     /// * `server_sender` - A UnboundedSender<ProtocolMessage> that holds the server sender
     pub fn handle_latest_block_request(&mut self, server_sender: UnboundedSender<ProtocolMessage>) {
-        if let Err(err) = self
-            .db_sender
-            .send(ProtocolMessage::FetchLatestBlock(server_sender))
-        {
-            error!(target: "handler", "Error from db_sender {}", err);
-        }
+        self.forward_to_database(ProtocolMessage::FetchLatestBlock(server_sender));
     }
 
     /// This function handles the block range request
@@ -350,12 +333,29 @@ impl Handler {
         end: u64,
         server_sender: UnboundedSender<ProtocolMessage>,
     ) {
-        if let Err(err) =
-            self.db_sender
-                .send(ProtocolMessage::FetchBlockRange(start, end, server_sender))
-        {
-            error!(target: "handler", "Error from db_sender {}", err);
+        self.forward_to_database(ProtocolMessage::FetchBlockRange(start, end, server_sender));
+    }
+
+    fn forward_to_database(&self, message: ProtocolMessage) {
+        if let Err(send_error) = self.db_sender.send(message) {
+            if let Some(reply) = detach_query_reply(send_error.0) {
+                let _ = reply.send(ProtocolMessage::QueryError(
+                    QueryFailureKind::Unavailable,
+                    "Database worker is unavailable",
+                ));
+            }
         }
+    }
+}
+
+fn detach_query_reply(message: ProtocolMessage) -> Option<UnboundedSender<ProtocolMessage>> {
+    match message {
+        ProtocolMessage::FetchTransactionDetails(_, reply)
+        | ProtocolMessage::FetchBlockDetails(_, reply)
+        | ProtocolMessage::FetchLatestBlock(reply)
+        | ProtocolMessage::FetchBlockRange(_, _, reply)
+        | ProtocolMessage::FetchAccountBalance(_, _, reply) => Some(reply),
+        _ => None,
     }
 }
 
