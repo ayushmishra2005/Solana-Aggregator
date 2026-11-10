@@ -230,23 +230,23 @@ async fn wait_for_database(
     message: ProtocolMessage,
     mut inbound: Receiver<ProtocolMessage>,
     timeout: Duration,
-) -> Result<ProtocolMessage, HttpResponse> {
+) -> Result<ProtocolMessage, Box<HttpResponse>> {
     if outbound.send(message).await.is_err() {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Database worker is unavailable",
-        ));
+        )));
     }
     match tokio::time::timeout(timeout, inbound.recv()).await {
         Ok(Some(reply)) => Ok(reply),
-        Ok(None) => Err(api_error(
+        Ok(None) => Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Database worker is unavailable",
-        )),
-        Err(_) => Err(api_error(
+        ))),
+        Err(_) => Err(Box::new(api_error(
             StatusCode::GATEWAY_TIMEOUT,
             "Database request timed out",
-        )),
+        ))),
     }
 }
 
@@ -283,7 +283,7 @@ async fn get_tx_details(tx_id: web::Path<String>, state: web::Data<ApiState>) ->
     .await
     {
         Ok(reply) => reply,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     response_for(reply)
 }
@@ -307,7 +307,7 @@ async fn get_block_details(
     .await
     {
         Ok(reply) => reply,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     response_for(reply)
 }
@@ -324,7 +324,7 @@ async fn get_latest_block(state: web::Data<ApiState>) -> impl Responder {
     .await
     {
         Ok(reply) => reply,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     response_for(reply)
 }
@@ -349,7 +349,7 @@ async fn get_block_range(
     .await
     {
         Ok(reply) => reply,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     response_for(reply)
 }
@@ -378,7 +378,7 @@ async fn get_account_balance(
     .await
     {
         Ok(reply) => reply,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     response_for(reply)
 }

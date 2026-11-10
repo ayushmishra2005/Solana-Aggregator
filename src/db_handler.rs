@@ -438,7 +438,7 @@ impl RocksDb {
         let mut planned: BTreeMap<u64, Block> = BTreeMap::new();
         let mut buffered = BTreeSet::new();
         if Self::extends_latest(latest, block_no) {
-            let snapshot = self.cumulative_block(&planned, latest, block);
+            let snapshot = self.cumulative_block(&planned, latest, block)?;
             latest = Some(block_no);
             planned.insert(block_no, snapshot);
         } else {
@@ -452,10 +452,10 @@ impl RocksDb {
             if !buffered.contains(&next) || planned.contains_key(&next) {
                 break;
             }
-            let Some(existing) = self.get_block(next) else {
+            let Some(existing) = self.read_stored_block(next).map_err(store_failure)? else {
                 break;
             };
-            let snapshot = self.cumulative_block(&planned, latest, existing);
+            let snapshot = self.cumulative_block(&planned, latest, existing)?;
             buffered.remove(&next);
             promoted.push(next);
             planned.insert(next, snapshot);
@@ -678,7 +678,7 @@ impl RocksDb {
         block_no: u64,
         incoming: &Block,
     ) -> Result<ExistingBlock, StoreFailure> {
-        let Some(stored) = self.get_block(block_no) else {
+        let Some(stored) = self.read_stored_block(block_no)? else {
             return Ok(ExistingBlock::Absent);
         };
         if Self::same_transactions(&stored, incoming) && Self::same_observations(&stored, incoming)
@@ -745,14 +745,14 @@ impl RocksDb {
         planned: &BTreeMap<u64, Block>,
         previous: Option<u64>,
         mut block: Block,
-    ) -> Block {
+    ) -> Result<Block, AggError> {
         let mut account_map = BTreeMap::new();
         if let Some(previous) = previous {
             if let Some(planned_block) = planned.get(&previous) {
                 if let Some(accounts) = planned_block.get_account_map() {
                     account_map.clone_from(&accounts);
                 }
-            } else if let Some(stored) = self.get_block(previous) {
+            } else if let Some(stored) = self.read_stored_block(previous).map_err(store_failure)? {
                 if let Some(accounts) = stored.get_account_map() {
                     account_map.clone_from(&accounts);
                 }
@@ -764,24 +764,29 @@ impl RocksDb {
             }
         }
         block.set_account_map(account_map);
-        block
+        Ok(block)
     }
 
-    /// This function gets the block
-    ///
-    /// # Arguments
-    ///
-    /// * `block_no` - A u64 that holds the block number
-    ///
-    /// # Returns
-    ///
-    /// * `Option<Block>` - An Option that holds the block
-    fn get_block(&self, block_no: u64) -> Option<Block> {
-        if let Ok(Some(block)) = self.db.get(format!("BlockNo{}", block_no)) {
-            Some(from_slice::<Block>(&block).unwrap())
-        } else {
-            None
+    /// Missing blocks are `Ok(None)`. Corrupt stored JSON is an error and is left untouched.
+    fn read_stored_block(&self, block_no: u64) -> Result<Option<Block>, StoreFailure> {
+        match self
+            .db
+            .get(format!("BlockNo{block_no}"))
+            .map_err(StoreFailure::Database)?
+        {
+            None => Ok(None),
+            Some(bytes) => match from_slice::<Block>(&bytes) {
+                Ok(block) => Ok(Some(block)),
+                Err(_) => Err(StoreFailure::Incompatible(
+                    "Corrupt block record. Existing records were not overwritten.".to_string(),
+                )),
+            },
         }
+    }
+
+    #[cfg(test)]
+    fn get_block(&self, block_no: u64) -> Result<Option<Block>, AggError> {
+        self.read_stored_block(block_no).map_err(store_failure)
     }
 
     /// This function gets the latest block
@@ -1117,7 +1122,7 @@ mod tests {
             }
             other => panic!("expected a write failure for slot 15, got {other:?}"),
         }
-        assert!(db.get_block(4).is_none());
+        assert!(db.get_block(4).unwrap().is_none());
         assert_eq!(db.read_checkpoint().expect("checkpoint"), Some(3));
     }
 
@@ -1149,7 +1154,7 @@ mod tests {
             server_receiver.try_recv(),
             Ok(ProtocolMessage::TxDetails(_))
         ));
-        assert!(db.get_block(4).is_some());
+        assert!(db.get_block(4).unwrap().is_some());
     }
 
     fn signature_key_count(db: &RocksDb) -> usize {
@@ -1197,13 +1202,14 @@ mod tests {
                 database
                     .get_block(42)
                     .expect("block")
+                    .expect("stored block")
                     .get_account_balance(&first.message.static_account_keys()[0].to_string()),
                 Some(balance)
             );
         }
         let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(path, receiver).expect("reopen");
-        assert!(database.get_block(42).is_some());
+        assert!(database.get_block(42).unwrap().is_some());
         let (reply_sender, mut reply_receiver) = crate::util::test_channel();
         database
             .handle_tx_request(first_signature, reply_sender.clone())
@@ -1240,11 +1246,11 @@ mod tests {
         database
             .handle_block(3, block.clone(), 3)
             .expect("first write");
-        let stored = database.get_block(3);
+        let stored = database.get_block(3).expect("read block");
         database
             .handle_block(3, block, 3)
             .expect("identical repeat");
-        assert_eq!(database.get_block(3), stored);
+        assert_eq!(database.get_block(3).expect("reread block"), stored);
         let mut changed = crate::util::Block::default();
         changed.push_transaction(
             solana_signature::Signature::from([8; 64]),
@@ -1252,7 +1258,7 @@ mod tests {
         );
         let conflict = database.handle_block(3, changed, 3);
         assert!(matches!(conflict, Err(AggError::ConflictingBlock)));
-        assert_eq!(database.get_block(3), stored);
+        assert_eq!(database.get_block(3).expect("unchanged block"), stored);
     }
 
     #[test]
@@ -1270,7 +1276,7 @@ mod tests {
             .handle_block(1, crate::util::Block::default(), 1)
             .expect_err("serialization");
         assert!(matches!(error, AggError::JsonError(_)));
-        assert!(database.get_block(1).is_none());
+        assert!(database.get_block(1).unwrap().is_none());
         assert!(database.get_latest_block().unwrap().is_none());
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(0));
     }
@@ -1324,7 +1330,7 @@ mod tests {
         database
             .handle_block(1, crate::util::Block::default(), 1)
             .expect("empty block");
-        assert!(database.get_block(1).is_some());
+        assert!(database.get_block(1).unwrap().is_some());
         assert_eq!(database.get_latest_block().unwrap(), Some(1));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(1));
         assert_eq!(signature_key_count(&database), 0);
@@ -1357,7 +1363,7 @@ mod tests {
         database.establish_initial_checkpoint(10).expect("boundary");
         let gap = database.handle_block(1, crate::util::Block::default(), 12);
         assert!(matches!(gap, Err(AggError::IncompatibleStorage(_))));
-        assert!(database.get_block(1).is_none());
+        assert!(database.get_block(1).unwrap().is_none());
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(10));
         database.record_skipped_slot(10).expect("already covered");
         database.record_skipped_slot(9).expect("older skip");
@@ -1385,7 +1391,7 @@ mod tests {
                 outcome_receiver.try_recv(),
                 Ok(ProtocolMessage::BlockProcessingResult(5, Ok(())))
             ));
-            assert!(database.get_block(5).is_none());
+            assert!(database.get_block(5).unwrap().is_none());
             assert_eq!(database.get_latest_block().unwrap(), None);
             assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(5));
             database.inject_write_failure();
@@ -1559,12 +1565,12 @@ mod tests {
         let (_sender, receiver) = crate::util::test_channel();
         let mut database = RocksDb::initialize(path, receiver).expect("reopen");
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
-        assert!(database.get_block(9).is_some());
+        assert!(database.get_block(9).unwrap().is_some());
         assert_eq!(database.get_latest_block().unwrap(), Some(9));
         let skipped = database.handle_block(10, crate::util::Block::default(), 6);
         assert!(matches!(skipped, Err(AggError::IncompatibleStorage(_))));
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(4));
-        assert!(database.get_block(10).is_none());
+        assert!(database.get_block(10).unwrap().is_none());
     }
 
     #[test]
@@ -1658,13 +1664,47 @@ mod tests {
             assert!(matches!(error, AggError::WriteFailed));
             assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(12));
             assert_eq!(lifecycle.snapshot().last_processed_slot, Some(12));
-            assert!(database.get_block(5).is_none());
+            assert!(database.get_block(5).unwrap().is_none());
         }
         let (_sender, receiver) = crate::util::test_channel();
         let database = RocksDb::initialize(path, receiver).expect("reopen");
         assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(12));
         assert_eq!(database.get_latest_block().unwrap(), Some(4));
-        assert!(database.get_block(4).is_some());
-        assert!(database.get_block(5).is_none());
+        assert!(database.get_block(4).unwrap().is_some());
+        assert!(database.get_block(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_block_record_is_distinct_from_a_missing_block() {
+        let directory = TempDir::new();
+        let path = directory.path.to_string_lossy().to_string();
+        let (_sender, receiver) = crate::util::test_channel();
+        let mut database = RocksDb::initialize(path.clone(), receiver).expect("open");
+        database.establish_initial_checkpoint(1).expect("boundary");
+        database
+            .handle_block(2, crate::util::Block::default(), 2)
+            .expect("persist");
+        database.corrupt_block_record(2).expect("corrupt");
+        assert!(database.get_block(99).expect("missing read").is_none());
+        let error = database.get_block(2).expect_err("corrupt read");
+        let rendered = error.to_string();
+        assert!(rendered.contains("Corrupt block record"), "{rendered}");
+        assert!(!rendered.contains(&path), "{rendered}");
+        assert!(!rendered.contains("not-json"), "{rendered}");
+        let rejected = database
+            .handle_block(3, crate::util::Block::default(), 3)
+            .expect_err("do not acknowledge the next slot");
+        assert!(matches!(rejected, AggError::IncompatibleStorage(_)));
+        assert_eq!(database.read_checkpoint().expect("checkpoint"), Some(2));
+        assert!(database.get_block(3).expect("next block").is_none());
+        assert!(
+            database
+                .db
+                .get("BlockNo2")
+                .expect("raw read")
+                .expect("corrupt bytes remain")
+                .as_slice()
+                == b"not-json"
+        );
     }
 }
