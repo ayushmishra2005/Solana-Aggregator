@@ -135,7 +135,7 @@ impl Parser {
         Ok(Some(u64::from_le_bytes(lamports)))
     }
 
-    /// Records at most the first two static-account balances.
+    /// Records every static-account balance.
     /// `post_balances` must cover every static account key.
     fn record_observed_balances(
         block: &mut Block,
@@ -145,7 +145,7 @@ impl Parser {
         if post_balances.len() < static_keys.len() {
             return Err(());
         }
-        for (key, balance) in static_keys.iter().zip(post_balances.iter()).take(2) {
+        for (key, balance) in static_keys.iter().zip(post_balances.iter()) {
             block.insert_account(key.to_string(), *balance);
         }
         Ok(())
@@ -355,10 +355,18 @@ mod tests {
         keys: Vec<Pubkey>,
         post_balances: Option<Vec<u64>>,
     ) -> EncodedTransactionWithStatusMeta {
+        encoded_with_signature(keys, post_balances, 9)
+    }
+
+    fn encoded_with_signature(
+        keys: Vec<Pubkey>,
+        post_balances: Option<Vec<u64>>,
+        signature_byte: u8,
+    ) -> EncodedTransactionWithStatusMeta {
         let signatures = if keys.is_empty() {
             Vec::new()
         } else {
-            vec![Signature::from([9; 64])]
+            vec![Signature::from([signature_byte; 64])]
         };
         let readonly_unsigned = keys.len().saturating_sub(1) as u8;
         let versioned = VersionedTransaction {
@@ -441,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn three_static_account_keys_keep_the_first_two_balances() {
+    fn three_static_account_keys_record_every_balance() {
         let first = account(8);
         let second = account(9);
         let third = account(10);
@@ -451,8 +459,8 @@ mod tests {
         ));
         assert_eq!(block.get_account_balance(&first.to_string()), Some(11));
         assert_eq!(block.get_account_balance(&second.to_string()), Some(22));
-        assert_eq!(block.get_account_balance(&third.to_string()), None);
-        assert_eq!(block.get_account_map().unwrap().len(), 2);
+        assert_eq!(block.get_account_balance(&third.to_string()), Some(33));
+        assert_eq!(block.get_account_map().unwrap().len(), 3);
     }
 
     #[test]
@@ -525,10 +533,108 @@ mod tests {
             block.get_account_balance(&static_keys[1].to_string()),
             Some(post_balances[1])
         );
-        assert_eq!(block.get_account_balance(&static_keys[2].to_string()), None);
-        assert_eq!(block.get_account_map().unwrap().len(), 2);
+        assert_eq!(
+            block.get_account_balance(&static_keys[2].to_string()),
+            Some(post_balances[2])
+        );
+        assert_eq!(block.get_account_map().unwrap().len(), static_keys.len());
         assert!(block
             .get_tx_details(&versioned.signatures[0].to_string())
+            .is_some());
+    }
+
+    #[test]
+    fn five_static_accounts_preserve_exact_lamport_values() {
+        let keys = vec![
+            account(21),
+            account(22),
+            account(23),
+            account(24),
+            account(25),
+        ];
+        let balances = vec![1, 42, u64::MAX, 7, 9_223_372_036_854_775_807];
+        let block = parse_accounts(encoded_accounts(keys.clone(), Some(balances.clone())));
+        assert_eq!(block.get_account_map().unwrap().len(), 5);
+        for (key, balance) in keys.iter().zip(balances.iter()) {
+            assert_eq!(block.get_account_balance(&key.to_string()), Some(*balance));
+        }
+    }
+
+    #[test]
+    fn fee_payer_sender_and_recipient_balances_follow_their_indexes() {
+        let fee_payer = Keypair::new();
+        let sender = Keypair::new();
+        let recipient = account(30);
+        let instruction = system_instruction::transfer(&sender.pubkey(), &recipient, 50);
+        let message = Message::new(&[instruction], Some(&fee_payer.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&fee_payer, &sender], Hash::new_from_array([4; 32]))
+            .expect("sign fee payer and sender");
+        let versioned = VersionedTransaction::from(transaction);
+        let static_keys = versioned.message.static_account_keys();
+        let payer_index = static_keys
+            .iter()
+            .position(|key| key == &fee_payer.pubkey())
+            .unwrap();
+        let sender_index = static_keys
+            .iter()
+            .position(|key| key == &sender.pubkey())
+            .unwrap();
+        let recipient_index = static_keys
+            .iter()
+            .position(|key| key == &recipient)
+            .unwrap();
+        assert_ne!(payer_index, sender_index);
+        assert_ne!(sender_index, recipient_index);
+        assert_ne!(payer_index, recipient_index);
+        let post_balances: Vec<u64> = (0..static_keys.len())
+            .map(|index| 1_000_000_000_000 + index as u64)
+            .collect();
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(balances_meta(post_balances.clone())),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let block = parse_accounts(encoded);
+        for (index, key) in static_keys.iter().enumerate() {
+            assert_eq!(
+                block.get_account_balance(&key.to_string()),
+                Some(post_balances[index])
+            );
+        }
+        assert!(block
+            .get_tx_details(&versioned.signatures[0].to_string())
+            .is_some());
+    }
+
+    #[test]
+    fn repeated_account_keeps_the_later_transaction_balance() {
+        let key = account(40);
+        let first = encoded_with_signature(vec![key], Some(vec![10]), 4);
+        let second = encoded_with_signature(vec![key], Some(vec![99]), 5);
+        let (sender, mut receiver) = unbounded_channel();
+        block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            3,
+            0,
+            1,
+            vec![first, second],
+            sender,
+        )))
+        .expect("parse ordered transactions");
+        let block = match receiver.try_recv().expect("parsed block") {
+            ProtocolMessage::ParsedBlock(_, _, _, block) => block,
+            other => panic!("expected a parsed block, got {other:?}"),
+        };
+        assert_eq!(block.get_account_balance(&key.to_string()), Some(99));
+        assert!(block
+            .get_tx_details(&Signature::from([4; 64]).to_string())
+            .is_some());
+        assert!(block
+            .get_tx_details(&Signature::from([5; 64]).to_string())
             .is_some());
     }
 }
