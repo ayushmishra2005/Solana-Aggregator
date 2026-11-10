@@ -19,6 +19,7 @@ pub enum AggError {
     TxNotFound,
     InvalidTransactionSignature,
     InvalidTransferInstruction,
+    InvalidBalanceMetadata,
 }
 
 impl Display for AggError {
@@ -38,6 +39,7 @@ impl Display for AggError {
             AggError::InvalidTransferInstruction => {
                 "Invalid system transfer instruction".to_string()
             }
+            AggError::InvalidBalanceMetadata => "Invalid balance metadata".to_string(),
             AggError::ServerError(err) => format!("Server Error {}", err),
         };
         write!(f, "{}", err_mgs)
@@ -63,6 +65,7 @@ impl Debug for AggError {
             AggError::InvalidTransferInstruction => {
                 "Invalid system transfer instruction".to_string()
             }
+            AggError::InvalidBalanceMetadata => "Invalid balance metadata".to_string(),
             AggError::ServerError(err) => format!("Server Error {:?}", err),
         };
         write!(f, "{}", err_mgs)

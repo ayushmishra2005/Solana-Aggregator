@@ -40,12 +40,12 @@ impl Parser {
                     }
                 }
                 if let Some(meta) = tx.meta.clone() {
-                    let sender_account = message.static_account_keys()[0];
-                    let sender_balance = meta.post_balances[0];
-                    let receiver_account = message.static_account_keys()[1];
-                    let receiver_balance = meta.post_balances[1];
-                    partial_block.insert_account(sender_account.to_string(), sender_balance);
-                    partial_block.insert_account(receiver_account.to_string(), receiver_balance);
+                    Self::record_observed_balances(
+                        &mut partial_block,
+                        message.static_account_keys(),
+                        &meta.post_balances,
+                    )
+                    .map_err(|()| AggError::InvalidBalanceMetadata)?;
                 }
                 partial_block
                     .push_transaction(signature, TxRecord::new(instructions, tx.meta.clone()));
@@ -135,6 +135,22 @@ impl Parser {
         Ok(Some(u64::from_le_bytes(lamports)))
     }
 
+    /// Records at most the first two static-account balances.
+    /// `post_balances` must cover every static account key.
+    fn record_observed_balances(
+        block: &mut Block,
+        static_keys: &[Pubkey],
+        post_balances: &[u64],
+    ) -> Result<(), ()> {
+        if post_balances.len() < static_keys.len() {
+            return Err(());
+        }
+        for (key, balance) in static_keys.iter().zip(post_balances.iter()).take(2) {
+            block.insert_account(key.to_string(), *balance);
+        }
+        Ok(())
+    }
+
     fn transfer_account(
         message: &VersionedMessage,
         instruction: &CompiledInstruction,
@@ -149,13 +165,20 @@ impl Parser {
 mod tests {
     use super::Parser;
     use crate::error::AggError;
-    use crate::util::Instruction;
+    use crate::util::{Block, Instruction, ProtocolMessage};
     use solana_program::hash::Hash;
     use solana_program::instruction::CompiledInstruction;
     use solana_program::message::{Message, MessageHeader, VersionedMessage};
     use solana_program::pubkey::Pubkey;
-    use solana_program::system_instruction::SystemInstruction;
+    use solana_program::system_instruction::{self, SystemInstruction};
     use solana_program::system_program;
+    use solana_sdk::signature::{Keypair, Signature, Signer};
+    use solana_sdk::transaction::{Transaction, TransactionVersion, VersionedTransaction};
+    use solana_transaction_status::{
+        EncodableWithMeta, EncodedTransactionWithStatusMeta, TransactionStatusMeta,
+        UiTransactionEncoding, UiTransactionStatusMeta,
+    };
+    use tokio::sync::mpsc::unbounded_channel;
 
     const LAMPORTS: u64 = 2_500_000_000;
 
@@ -307,5 +330,205 @@ mod tests {
                 ]
             })
         );
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
+    }
+
+    fn balances_meta(post_balances: Vec<u64>) -> UiTransactionStatusMeta {
+        serde_json::from_value(serde_json::json!({
+            "err": null,
+            "status": {"Ok": null},
+            "fee": 5000,
+            "preBalances": post_balances,
+            "postBalances": post_balances,
+        }))
+        .expect("balance metadata")
+    }
+
+    fn encoded_accounts(
+        keys: Vec<Pubkey>,
+        post_balances: Option<Vec<u64>>,
+    ) -> EncodedTransactionWithStatusMeta {
+        let signatures = if keys.is_empty() {
+            Vec::new()
+        } else {
+            vec![Signature::from([9; 64])]
+        };
+        let readonly_unsigned = keys.len().saturating_sub(1) as u8;
+        let versioned = VersionedTransaction {
+            signatures,
+            message: VersionedMessage::Legacy(Message {
+                header: MessageHeader {
+                    num_required_signatures: u8::from(!keys.is_empty()),
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: readonly_unsigned,
+                },
+                account_keys: keys,
+                recent_blockhash: Hash::new_from_array([1; 32]),
+                instructions: vec![],
+            }),
+        };
+        EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: post_balances.map(balances_meta),
+            version: Some(TransactionVersion::LEGACY),
+        }
+    }
+
+    fn parse_accounts(transaction: EncodedTransactionWithStatusMeta) -> Block {
+        let (sender, mut receiver) = unbounded_channel();
+        block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            1,
+            0,
+            1,
+            vec![transaction],
+            sender,
+        )))
+        .expect("parse accounts");
+        match receiver.try_recv() {
+            Ok(ProtocolMessage::ParsedBlock(_, _, _, block)) => block,
+            Ok(other) => panic!("expected a parsed block, got {other:?}"),
+            Err(_) => panic!("parser succeeded without emitting a block"),
+        }
+    }
+
+    fn assert_balance_error(transaction: EncodedTransactionWithStatusMeta) {
+        let (sender, mut receiver) = unbounded_channel();
+        let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            1,
+            0,
+            1,
+            vec![transaction],
+            sender,
+        )))
+        .expect_err("malformed balance metadata");
+        assert!(matches!(error, AggError::InvalidBalanceMetadata));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn zero_static_account_keys_record_nothing() {
+        let mut block = Block::default();
+        Parser::record_observed_balances(&mut block, &[], &[]).expect("empty account list");
+        assert!(block.get_account_map().is_none());
+    }
+
+    #[test]
+    fn one_static_account_key_records_its_balance() {
+        let key = account(8);
+        let block = parse_accounts(encoded_accounts(vec![key], Some(vec![42])));
+        assert_eq!(block.get_account_balance(&key.to_string()), Some(42));
+        assert_eq!(block.get_account_map().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_static_account_keys_record_both_balances() {
+        let first = account(8);
+        let second = account(9);
+        let block = parse_accounts(encoded_accounts(vec![first, second], Some(vec![11, 22])));
+        assert_eq!(block.get_account_balance(&first.to_string()), Some(11));
+        assert_eq!(block.get_account_balance(&second.to_string()), Some(22));
+        assert_eq!(block.get_account_map().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn three_static_account_keys_keep_the_first_two_balances() {
+        let first = account(8);
+        let second = account(9);
+        let third = account(10);
+        let block = parse_accounts(encoded_accounts(
+            vec![first, second, third],
+            Some(vec![11, 22, 33]),
+        ));
+        assert_eq!(block.get_account_balance(&first.to_string()), Some(11));
+        assert_eq!(block.get_account_balance(&second.to_string()), Some(22));
+        assert_eq!(block.get_account_balance(&third.to_string()), None);
+        assert_eq!(block.get_account_map().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn empty_post_balances_are_rejected() {
+        assert_balance_error(encoded_accounts(vec![account(8), account(9)], Some(vec![])));
+    }
+
+    #[test]
+    fn one_post_balance_is_rejected_for_two_accounts() {
+        assert_balance_error(encoded_accounts(
+            vec![account(8), account(9)],
+            Some(vec![11]),
+        ));
+    }
+
+    #[test]
+    fn two_post_balances_are_recorded() {
+        let first = account(8);
+        let second = account(9);
+        let block = parse_accounts(encoded_accounts(vec![first, second], Some(vec![70, 80])));
+        assert_eq!(block.get_account_balance(&first.to_string()), Some(70));
+        assert_eq!(block.get_account_balance(&second.to_string()), Some(80));
+    }
+
+    #[test]
+    fn post_balances_shorter_than_static_accounts_are_rejected() {
+        assert_balance_error(encoded_accounts(
+            vec![account(8), account(9), account(10)],
+            Some(vec![11, 22]),
+        ));
+    }
+
+    #[test]
+    fn absent_metadata_records_no_balances() {
+        let key = account(8);
+        let block = parse_accounts(encoded_accounts(vec![key], None));
+        assert!(block.get_account_map().is_none());
+        assert!(block
+            .get_tx_details(&Signature::from([9; 64]).to_string())
+            .is_some());
+    }
+
+    #[test]
+    fn signed_transfer_preserves_existing_balance_observations() {
+        let payer = Keypair::new();
+        let recipient = account(12);
+        let instruction = system_instruction::transfer(&payer.pubkey(), &recipient, 1_500);
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&payer], Hash::new_from_array([7; 32]))
+            .expect("sign transfer");
+        let versioned = VersionedTransaction::from(transaction);
+        let post_balances = vec![1_000_000, 1_500, 1];
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(balances_meta(post_balances.clone())),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let block = parse_accounts(encoded);
+        let static_keys = versioned.message.static_account_keys();
+        assert_eq!(
+            block.get_account_balance(&static_keys[0].to_string()),
+            Some(post_balances[0])
+        );
+        assert_eq!(
+            block.get_account_balance(&static_keys[1].to_string()),
+            Some(post_balances[1])
+        );
+        assert_eq!(block.get_account_balance(&static_keys[2].to_string()), None);
+        assert_eq!(block.get_account_map().unwrap().len(), 2);
+        assert!(block
+            .get_tx_details(&versioned.signatures[0].to_string())
+            .is_some());
     }
 }
