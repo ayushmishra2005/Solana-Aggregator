@@ -27,6 +27,13 @@ enum BlockFetch {
     Failed(AggError),
 }
 
+enum SlotProgress {
+    CaughtUp,
+    Advanced,
+    Halted,
+    SlotQueryFailed,
+}
+
 pub struct Subscriber {
     latest_slot: u64,
     chain_url: String,
@@ -79,28 +86,48 @@ impl Subscriber {
     /// This function runs the subscriber client
     pub async fn run(&mut self) {
         loop {
-            match self.fetch_latest_slot() {
-                Ok(fetched_slot) => {
-                    if self.latest_slot < fetched_slot {
-                        self.latest_slot = self.latest_slot.saturating_add(1);
-                        let sender_clone = self.unbounded_sender.clone();
-                        let chain_url = self.chain_url.clone();
-                        let rpc_block_config = self.rpc_block_config.clone();
-                        let latest_slot = self.latest_slot;
-                        tokio::spawn(async move {
-                            BlockFetcher::invoke(ProtocolMessage::fetch_block(
-                                chain_url,
-                                rpc_block_config,
-                                latest_slot,
-                                sender_clone,
-                            ))
-                            .await;
-                        });
-                    }
-                }
-                Err(err) => {
-                    error!(target: "subscriber", "Failed to fetch latest slot {:?}", err);
-                }
+            if matches!(self.advance_once().await, SlotProgress::Halted) {
+                break;
+            }
+        }
+    }
+
+    /// Fetches the next finalized slot and advances `latest_slot` only after
+    /// a fetched block or an authoritative skip. A failed fetch leaves the cursor
+    /// on the last progressed slot.
+    async fn advance_once(&mut self) -> SlotProgress {
+        let fetched_slot = match self.fetch_latest_slot() {
+            Ok(slot) => slot,
+            Err(err) => {
+                error!(target: "subscriber", "Failed to fetch latest slot {:?}", err);
+                return SlotProgress::SlotQueryFailed;
+            }
+        };
+        if self.latest_slot >= fetched_slot {
+            return SlotProgress::CaughtUp;
+        }
+        let slot = self.latest_slot.saturating_add(1);
+        let outcome = BlockFetcher::invoke(
+            &self.rpc_client,
+            ProtocolMessage::fetch_block(
+                self.chain_url.clone(),
+                self.rpc_block_config,
+                slot,
+                self.unbounded_sender.clone(),
+            ),
+        )
+        .await;
+        match outcome {
+            BlockFetch::Fetched(_) | BlockFetch::Skipped(_) => {
+                self.latest_slot = slot;
+                SlotProgress::Advanced
+            }
+            BlockFetch::Failed(err) => {
+                error!(
+                    target: "subscriber",
+                    "Stopping slot progression at {slot} after getBlock failed: {err:?}"
+                );
+                SlotProgress::Halted
             }
         }
     }
@@ -110,20 +137,14 @@ struct BlockFetcher;
 
 impl BlockFetcher {
 
-    /// This function invokes the block fetcher
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - A ProtocolMessage that holds the message
-    async fn invoke(message: ProtocolMessage) {
+    async fn invoke(client: &RpcClient, message: ProtocolMessage) -> BlockFetch {
         match message {
-            ProtocolMessage::FetchBlock(chain_url, rpc_block_config, latest_slot, sender) => {
-                let client =
-                    RpcClient::new_with_timeout(chain_url, std::time::Duration::from_secs(30));
-                let _outcome =
-                    Self::request_block(&client, latest_slot, rpc_block_config, sender).await;
+            ProtocolMessage::FetchBlock(_chain_url, rpc_block_config, slot, sender) => {
+                Self::request_block(client, slot, rpc_block_config, sender).await
             }
-            _ => {}
+            _ => BlockFetch::Failed(AggError::ClientError(ClientError::from(
+                ClientErrorKind::Custom("block fetcher received an unexpected message".to_string()),
+            ))),
         }
     }
 
@@ -491,7 +512,7 @@ mod tests {
         assert!(!logged.contains(&secret_query), "{logged}");
     }
 
-    use super::BlockFetch;
+    use super::{BlockFetch, SlotProgress, Subscriber};
     use crate::util::ProtocolMessage;
     use solana_client::client_error::ClientError;
     use solana_client::rpc_custom_error::{
@@ -1127,5 +1148,204 @@ mod tests {
             vec![Duration::from_millis(200), Duration::from_millis(400)]
         );
         assert!(exhausted.receiver.try_recv().is_err());
+    }
+
+    struct ProgressionRpc {
+        tip: u64,
+        blocks: Mutex<VecDeque<RpcResult<serde_json::Value>>>,
+        calls: RecordedCalls,
+    }
+
+    impl RpcSender for ProgressionRpc {
+        fn send<'life0, 'async_trait>(
+            &'life0 self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = RpcResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let response = match &request {
+                RpcRequest::GetSlot => Ok(serde_json::json!(self.tip)),
+                RpcRequest::GetBlock => self
+                    .blocks
+                    .lock()
+                    .expect("block script")
+                    .pop_front()
+                    .expect("unexpected getBlock"),
+                _ => panic!("unexpected rpc request"),
+            };
+            self.calls
+                .lock()
+                .expect("rpc recorder")
+                .push((request, params));
+            Box::pin(async move { response })
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1/?api-key={RPC_SECRET}")
+        }
+    }
+
+    fn progression_subscriber(
+        cursor: u64,
+        tip: u64,
+        blocks: Vec<RpcResult<serde_json::Value>>,
+    ) -> (
+        Subscriber,
+        RecordedCalls,
+        tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let rpc = ProgressionRpc {
+            tip,
+            blocks: Mutex::new(VecDeque::from(blocks)),
+            calls: Arc::clone(&calls),
+        };
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber {
+            latest_slot: cursor,
+            chain_url: format!("http://127.0.0.1/?api-key={RPC_SECRET}"),
+            rpc_client: RpcClient::new_sender(
+                rpc,
+                RpcClientConfig::with_commitment(CommitmentConfig::finalized()),
+            ),
+            rpc_block_config: block_config(),
+            unbounded_sender: sender,
+        };
+        (subscriber, calls, receiver)
+    }
+
+    fn block_requests(calls: &[(RpcRequest, serde_json::Value)]) -> Vec<u64> {
+        calls
+            .iter()
+            .filter(|(request, _)| *request == RpcRequest::GetBlock)
+            .map(|(_, params)| {
+                let params = params.as_array().expect("getBlock params");
+                assert_eq!(
+                    params
+                        .get(1)
+                        .and_then(|config| config.get("commitment"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("finalized")
+                );
+                params[0].as_u64().expect("getBlock slot")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subscriber_progresses_only_through_fetched_and_skipped_slots() {
+        let (transaction, signature, _) = sample_transaction();
+        let secret_failure = format!("http://127.0.0.1/?api-key={RPC_SECRET}");
+        block_on(async {
+            let (mut subscriber, calls, mut receiver) = progression_subscriber(
+                100,
+                110,
+                vec![
+                    Ok(confirmed_block(transaction)),
+                    Err(rpc_failure(
+                        JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
+                        "Slot 102 was skipped, or missing due to ledger jump to recent snapshot"
+                            .to_string(),
+                    )),
+                    Err(rpc_failure(-32602, secret_failure.clone())),
+                ],
+            );
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Advanced
+            ));
+            assert_eq!(subscriber.latest_slot, 101);
+            match wait_for_one_parsed(&mut receiver).await {
+                ProtocolMessage::ParsedBlock(block_no, total_chunks, chunk_no, block) => {
+                    assert_eq!((block_no, total_chunks, chunk_no), (42, 1, 0));
+                    assert!(block.get_tx_details(&signature).is_some());
+                }
+                other => panic!("expected one parsed block, got {other:?}"),
+            }
+
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Advanced
+            ));
+            assert_eq!(subscriber.latest_slot, 102);
+            tokio::task::yield_now().await;
+            assert!(receiver.try_recv().is_err());
+
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Halted
+            ));
+            assert_eq!(subscriber.latest_slot, 102);
+            tokio::task::yield_now().await;
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(
+                block_requests(&calls.lock().expect("calls")),
+                vec![101, 102, 103]
+            );
+        });
+    }
+
+    #[test]
+    fn subscriber_stops_when_a_slot_remains_unresolved() {
+        let secret = format!("http://127.0.0.1/?api-key={RPC_SECRET}");
+        let (mut subscriber, calls, mut receiver) =
+            progression_subscriber(100, 110, vec![Err(rpc_failure(-32602, secret.clone()))]);
+        let logged = capture_fetch_logs(|| {
+            block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), subscriber.run())
+                    .await
+                    .expect("subscriber stopped after the failed slot");
+            });
+        });
+        assert_eq!(subscriber.latest_slot, 100);
+        assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            logged.contains("Stopping slot progression at 101"),
+            "{logged}"
+        );
+        assert!(logged.contains("Failed to fetch block"), "{logged}");
+        assert!(!logged.contains(RPC_SECRET), "{logged}");
+        assert!(!logged.contains("api-key="), "{logged}");
+    }
+
+    #[test]
+    fn retry_exhaustion_does_not_advance_or_fetch_later_slots() {
+        let mut failures = Vec::new();
+        for _ in 0..3 {
+            failures.push(Err(rpc_failure(
+                JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+                "Block not available for slot 51".to_string(),
+            )));
+        }
+        let (mut subscriber, calls, mut receiver) = progression_subscriber(50, 80, failures);
+        block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), subscriber.run())
+                .await
+                .expect("subscriber stopped after retry exhaustion");
+        });
+        assert_eq!(subscriber.latest_slot, 50);
+        assert_eq!(
+            block_requests(&calls.lock().expect("calls")),
+            vec![51, 51, 51]
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscriber_does_not_fetch_when_the_cursor_is_caught_up() {
+        let (mut subscriber, calls, mut receiver) = progression_subscriber(40, 40, Vec::new());
+        let progress = block_on(subscriber.advance_once());
+        assert!(matches!(progress, SlotProgress::CaughtUp));
+        assert_eq!(subscriber.latest_slot, 40);
+        assert!(block_requests(&calls.lock().expect("calls")).is_empty());
+        assert!(receiver.try_recv().is_err());
     }
 }
