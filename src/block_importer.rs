@@ -142,7 +142,11 @@ impl BlockFetcher {
                 }
             }
             Err(err) => {
-                error!(target: "subscriber", "Failed to fetch block {:?}", err);
+                error!(
+                    target: "subscriber",
+                    "Failed to fetch block {:?}",
+                    AggError::from(err)
+                );
             }
         }
     }
@@ -239,5 +243,99 @@ mod tests {
     #[test]
     fn fetch_block_requests_slot_1000() {
         assert_eq!(rpc_slot_requested(1000), 1000);
+    }
+
+    const RPC_SECRET: &str = "synthetic-secret";
+
+    struct FetchLogCapture;
+
+    static FETCH_LOG: Mutex<Option<String>> = Mutex::new(None);
+    static FETCH_LOGGER: FetchLogCapture = FetchLogCapture;
+
+    impl log::Log for FetchLogCapture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target() == "subscriber"
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if record.target() != "subscriber" {
+                return;
+            }
+            let mut slot = FETCH_LOG
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(logs) = slot.as_mut() {
+                logs.push_str(&record.args().to_string());
+                logs.push('\n');
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn capture_fetch_logs(log_error: impl FnOnce()) -> String {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = log::set_logger(&FETCH_LOGGER);
+            log::set_max_level(log::LevelFilter::Error);
+        });
+        {
+            let mut slot = FETCH_LOG
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(String::new());
+        }
+        log_error();
+        let mut slot = FETCH_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.take().unwrap_or_default()
+    }
+
+    #[test]
+    fn fetch_block_error_log_hides_rpc_credential() {
+        let secret_query = format!("api-key={RPC_SECRET}");
+        let url = format!("http://127.0.0.1:1/?{secret_query}");
+        let client = RpcClient::new_with_timeout(url, std::time::Duration::from_secs(2));
+        let config = RpcBlockConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            transaction_details: None,
+            rewards: None,
+            commitment: Some(CommitmentConfig::finalized()),
+            max_supported_transaction_version: Some(0),
+        };
+        let raw = client
+            .get_block_with_config(100, config)
+            .expect_err("closed local port should fail getBlock");
+        let raw_display = raw.to_string();
+        let raw_debug = format!("{raw:?}");
+        assert!(
+            raw_display.contains(RPC_SECRET) || raw_debug.contains(RPC_SECRET),
+            "getBlock ClientError did not include the synthetic credential, so log redaction was not exercised. display={}",
+            raw_display.replace(RPC_SECRET, "<secret>")
+        );
+
+        let agg = crate::error::AggError::from(raw);
+        let display = agg.to_string();
+        let debug = format!("{agg:?}");
+        for output in [&display, &debug] {
+            assert!(!output.contains(RPC_SECRET), "{output}");
+            assert!(!output.contains(&secret_query), "{output}");
+            assert!(output.contains("Client Error:"), "{output}");
+            assert!(output.contains("127.0.0.1"), "{output}");
+        }
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let logged = capture_fetch_logs(|| {
+            BlockFetcher::request_block(&client, 100, config, sender);
+        });
+        assert!(
+            logged.contains("Failed to fetch block"),
+            "fetch error was not logged: {logged}"
+        );
+        assert!(logged.contains("Client Error:"), "{logged}");
+        assert!(logged.contains("127.0.0.1"), "{logged}");
+        assert!(!logged.contains(RPC_SECRET), "{logged}");
+        assert!(!logged.contains(&secret_query), "{logged}");
     }
 }
