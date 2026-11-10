@@ -101,43 +101,143 @@ impl BlockFetcher {
             ProtocolMessage::FetchBlock(chain_url, rpc_block_config, latest_slot, sender) => {
                 let client =
                     RpcClient::new_with_timeout(chain_url, std::time::Duration::from_secs(30));
-                match client
-                    .get_block_with_config(latest_slot.saturating_sub(500), rpc_block_config)
-                {
-                    Ok(block) => {
-                        if let Some(block_no) = block.block_height {
-                            if let Some(txs) = block.transactions {
-                                let chunks = txs.chunks(10);
-                                let len_of_chunks = chunks.len() as u64;
-                                for (index, chunk) in chunks.enumerate() {
-                                    let sender_clone = sender.clone();
-                                    let chunk_clone = chunk.to_vec();
-                                    tokio::spawn(async move {
-                                        if let Err(error) =
-                                            Parser::invoke(ProtocolMessage::new_chuck(
-                                                block_no,
-                                                index as u64,
-                                                len_of_chunks,
-                                                chunk_clone,
-                                                sender_clone,
-                                            ))
-                                            .await
-                                        {
-                                            error!(target: "subscriber", "Error from Parser {}", error);
-                                        }
-                                    });
-                                }
-                            }
-                        } else {
-                            warn!(target: "subscriber", "Block Number not available");
-                        }
-                    }
-                    Err(err) => {
-                        error!(target: "subscriber", "Failed to fetch block {:?}", err);
-                    }
-                }
+                Self::request_block(&client, latest_slot, rpc_block_config, sender);
             }
             _ => {}
         }
+    }
+
+    fn request_block(
+        client: &RpcClient,
+        slot: u64,
+        rpc_block_config: RpcBlockConfig,
+        sender: UnboundedSender<ProtocolMessage>,
+    ) {
+        match client.get_block_with_config(slot, rpc_block_config) {
+            Ok(block) => {
+                if let Some(block_no) = block.block_height {
+                    if let Some(txs) = block.transactions {
+                        let chunks = txs.chunks(10);
+                        let len_of_chunks = chunks.len() as u64;
+                        for (index, chunk) in chunks.enumerate() {
+                            let sender_clone = sender.clone();
+                            let chunk_clone = chunk.to_vec();
+                            tokio::spawn(async move {
+                                if let Err(error) = Parser::invoke(ProtocolMessage::new_chuck(
+                                    block_no,
+                                    index as u64,
+                                    len_of_chunks,
+                                    chunk_clone,
+                                    sender_clone,
+                                ))
+                                .await
+                                {
+                                    error!(target: "subscriber", "Error from Parser {}", error);
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    warn!(target: "subscriber", "Block Number not available");
+                }
+            }
+            Err(err) => {
+                error!(target: "subscriber", "Failed to fetch block {:?}", err);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlockFetcher;
+    use solana_client::client_error::Result as RpcResult;
+    use solana_client::rpc_client::{RpcClient, RpcClientConfig};
+    use solana_client::rpc_config::RpcBlockConfig;
+    use solana_client::rpc_request::RpcRequest;
+    use solana_client::rpc_sender::{RpcSender, RpcTransportStats};
+    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_transaction_status::UiTransactionEncoding;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingSender {
+        calls: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
+    }
+
+    impl RpcSender for RecordingSender {
+        fn send<'life0, 'async_trait>(
+            &'life0 self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = RpcResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.calls
+                .lock()
+                .expect("rpc recorder")
+                .push((request, params));
+            Box::pin(async { Ok(serde_json::Value::Null) })
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "recording-sender".to_string()
+        }
+    }
+
+    fn rpc_slot_requested(slot: u64) -> u64 {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client = RpcClient::new_sender(
+            RecordingSender {
+                calls: Arc::clone(&calls),
+            },
+            RpcClientConfig::with_commitment(CommitmentConfig::finalized()),
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let config = RpcBlockConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            transaction_details: None,
+            rewards: None,
+            commitment: Some(CommitmentConfig::finalized()),
+            max_supported_transaction_version: Some(0),
+        };
+
+        BlockFetcher::request_block(&client, slot, config, sender);
+
+        let calls = calls.lock().expect("rpc recorder");
+        assert_eq!(calls.len(), 1, "slot {slot} should issue one RPC request");
+        assert_eq!(calls[0].0, RpcRequest::GetBlock);
+        let params = calls[0].1.as_array().expect("getBlock params");
+        assert_eq!(
+            params
+                .get(1)
+                .and_then(|config| config.get("commitment"))
+                .and_then(serde_json::Value::as_str),
+            Some("finalized"),
+            "block fetch must keep the finalized commitment"
+        );
+        params[0].as_u64().expect("getBlock slot")
+    }
+
+    #[test]
+    fn fetch_block_requests_slot_100() {
+        assert_eq!(rpc_slot_requested(100), 100);
+    }
+
+    #[test]
+    fn fetch_block_requests_slot_500() {
+        assert_eq!(rpc_slot_requested(500), 500);
+    }
+
+    #[test]
+    fn fetch_block_requests_slot_1000() {
+        assert_eq!(rpc_slot_requested(1000), 1000);
     }
 }
