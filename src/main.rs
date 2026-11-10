@@ -15,6 +15,20 @@ mod parser;
 mod server;
 mod util;
 
+fn resume_subscriber(
+    subscriber: &mut block_importer::Subscriber,
+    database: &mut db_handler::RocksDb,
+) -> Result<(), String> {
+    if let Some(checkpoint) = database.read_checkpoint()? {
+        subscriber.resume_from_checkpoint(checkpoint);
+        return Ok(());
+    }
+    if database.has_indexed_records()? {
+        return Err("RocksDB has indexed blocks but no last_processed_slot checkpoint. Use a fresh database directory or reindex explicitly. Existing records were not overwritten.".to_string());
+    }
+    database.establish_initial_checkpoint(subscriber.completed_slot())
+}
+
 #[tokio::main]
 async fn main() {
     let opt: Cli = Cli::from_args();
@@ -51,6 +65,10 @@ async fn main() {
         }
     };
     db_client.set_block_outcomes(block_outcome_sender);
+    if let Err(error) = resume_subscriber(&mut subscriber_client, &mut db_client) {
+        error!(target: "subscriber", "Error restoring slot checkpoint {}", error);
+        return;
+    }
     tokio::spawn(async move {
         db_client.run().await;
     });

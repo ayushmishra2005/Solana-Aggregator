@@ -80,6 +80,14 @@ impl Subscriber {
         })
     }
 
+    pub fn resume_from_checkpoint(&mut self, slot: u64) {
+        self.latest_slot = slot;
+    }
+
+    pub fn completed_slot(&self) -> u64 {
+        self.latest_slot
+    }
+
     pub fn set_block_outcomes(
         &mut self,
         sender: UnboundedSender<ProtocolMessage>,
@@ -133,8 +141,30 @@ impl Subscriber {
         .await;
         match outcome {
             BlockFetch::Skipped(_) => {
-                self.latest_slot = slot;
-                SlotProgress::Advanced
+                if self
+                    .unbounded_sender
+                    .send(ProtocolMessage::RecordSkippedSlot(slot))
+                    .is_err()
+                {
+                    error!(
+                        target: "subscriber",
+                        "Stopping slot progression at {slot}: database channel closed"
+                    );
+                    return SlotProgress::Halted;
+                }
+                match self.wait_for_block(slot).await {
+                    Ok(()) => {
+                        self.latest_slot = slot;
+                        SlotProgress::Advanced
+                    }
+                    Err(err) => {
+                        error!(
+                            target: "subscriber",
+                            "Stopping slot progression at {slot} after skipped-slot checkpoint failed: {err}"
+                        );
+                        SlotProgress::Halted
+                    }
+                }
             }
             BlockFetch::Fetched(_) => match self.wait_for_block(slot).await {
                 Ok(()) => {
@@ -355,7 +385,16 @@ impl BlockFetcher {
                         let chunks = txs.chunks(10);
                         let len_of_chunks = chunks.len() as u64;
                         if len_of_chunks == 0 {
-                            Self::report_processing(outcome_sender, fetch_slot, Ok(()));
+                            if sender
+                                .send(ProtocolMessage::StoreEmptyBlock(block_no, fetch_slot))
+                                .is_err()
+                            {
+                                Self::report_processing(
+                                    outcome_sender,
+                                    fetch_slot,
+                                    Err("database channel closed".to_string()),
+                                );
+                            }
                             return;
                         }
                         let _ = sender.send(ProtocolMessage::ExpectBlock(
@@ -1398,14 +1437,24 @@ mod tests {
             let (outcome_tx, outcome_rx) = tokio::sync::mpsc::unbounded_channel();
             subscriber.set_block_outcomes(outcome_tx.clone(), outcome_rx);
             let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+            let mut seen_tx = Some(seen_tx);
             tokio::spawn(async move {
                 while let Some(message) = receiver.recv().await {
-                    if let ProtocolMessage::ParsedBlock(_, _, _, _) = &message {
-                        outcome_tx
-                            .send(ProtocolMessage::BlockProcessingResult(101, Ok(())))
-                            .expect("outcome");
-                        let _ = seen_tx.send(message);
-                        break;
+                    match message {
+                        ProtocolMessage::ParsedBlock(_, _, _, _) => {
+                            outcome_tx
+                                .send(ProtocolMessage::BlockProcessingResult(101, Ok(())))
+                                .expect("outcome");
+                            if let Some(sender) = seen_tx.take() {
+                                let _ = sender.send(message);
+                            }
+                        }
+                        ProtocolMessage::RecordSkippedSlot(slot) => {
+                            outcome_tx
+                                .send(ProtocolMessage::BlockProcessingResult(slot, Ok(())))
+                                .expect("skipped slot outcome");
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -1595,6 +1644,123 @@ mod tests {
             assert_eq!(subscriber.latest_slot, 100);
             assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
             assert!(db_receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn skipped_slot_checkpoint_failure_stops_progression() {
+        block_on(async {
+            let (mut subscriber, calls, mut receiver) = progression_subscriber(
+                100,
+                110,
+                vec![Err(rpc_failure(
+                    JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
+                    "Slot 101 was skipped".to_string(),
+                ))],
+            );
+            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            subscriber.set_block_outcomes(outcome_sender.clone(), outcome_receiver);
+            tokio::spawn(async move {
+                while let Some(message) = receiver.recv().await {
+                    if let ProtocolMessage::RecordSkippedSlot(slot) = message {
+                        outcome_sender
+                            .send(ProtocolMessage::BlockProcessingResult(
+                                slot,
+                                Err("checkpoint write failed".to_string()),
+                            ))
+                            .expect("outcome");
+                        break;
+                    }
+                }
+            });
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), subscriber.advance_once()).await,
+                Ok(SlotProgress::Halted)
+            ));
+            assert_eq!(subscriber.latest_slot, 100);
+            assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
+        });
+    }
+
+    #[test]
+    fn subscriber_resumes_from_checkpoint_instead_of_the_live_tip() {
+        block_on(async {
+            let (mut subscriber, calls, _receiver) = progression_subscriber(
+                500,
+                500,
+                vec![Err(rpc_failure(-32602, "unavailable".to_string()))],
+            );
+            subscriber.resume_from_checkpoint(20);
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Halted
+            ));
+            assert_eq!(subscriber.latest_slot, 20);
+            assert_eq!(block_requests(&calls.lock().expect("calls")), vec![21]);
+        });
+    }
+
+    #[test]
+    fn empty_fetched_block_waits_for_durable_acknowledgment() {
+        block_on(async {
+            let value = serde_json::to_value(UiConfirmedBlock {
+                previous_blockhash: "11111111111111111111111111111111".to_string(),
+                blockhash: "11111111111111111111111111111111".to_string(),
+                parent_slot: 99,
+                transactions: Some(vec![]),
+                signatures: None,
+                rewards: None,
+                num_reward_partitions: None,
+                block_time: Some(0),
+                block_height: Some(7),
+            })
+            .expect("empty block");
+            let (mut subscriber, calls, mut receiver) =
+                progression_subscriber(100, 110, vec![Ok(value)]);
+            let (outcome_sender, outcome_receiver) = tokio::sync::mpsc::unbounded_channel();
+            subscriber.set_block_outcomes(outcome_sender.clone(), outcome_receiver);
+            tokio::spawn(async move {
+                while let Some(message) = receiver.recv().await {
+                    if let ProtocolMessage::StoreEmptyBlock(height, slot) = message {
+                        assert_eq!((height, slot), (7, 101));
+                        outcome_sender
+                            .send(ProtocolMessage::BlockProcessingResult(slot, Ok(())))
+                            .expect("outcome");
+                        break;
+                    }
+                }
+            });
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), subscriber.advance_once()).await;
+            assert!(matches!(result, Ok(SlotProgress::Advanced)));
+            assert_eq!(subscriber.latest_slot, 101);
+            assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
+        });
+    }
+
+    #[test]
+    fn missing_block_height_does_not_advance() {
+        block_on(async {
+            let value = serde_json::to_value(UiConfirmedBlock {
+                previous_blockhash: "11111111111111111111111111111111".to_string(),
+                blockhash: "11111111111111111111111111111111".to_string(),
+                parent_slot: 99,
+                transactions: Some(vec![]),
+                signatures: None,
+                rewards: None,
+                num_reward_partitions: None,
+                block_time: Some(0),
+                block_height: None,
+            })
+            .expect("missing height");
+            let (mut subscriber, _calls, mut receiver) =
+                progression_subscriber(100, 110, vec![Ok(value)]);
+            assert!(matches!(
+                subscriber.advance_once().await,
+                SlotProgress::Halted
+            ));
+            assert_eq!(subscriber.latest_slot, 100);
+            assert!(receiver.try_recv().is_err());
         });
     }
 }

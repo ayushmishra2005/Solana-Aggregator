@@ -62,6 +62,28 @@ impl Handler {
                         self.fetch_slots.insert(block_no, fetch_slot);
                         self.note_expected_total(block_no, total_chunks);
                     }
+                    ProtocolMessage::RecordSkippedSlot(fetch_slot) => {
+                        if self
+                            .db_sender
+                            .send(ProtocolMessage::RecordSkippedSlot(fetch_slot))
+                            .is_err()
+                        {
+                            self.report(fetch_slot, Err("database channel closed".to_string()));
+                        }
+                    }
+                    ProtocolMessage::StoreEmptyBlock(block_height, fetch_slot) => {
+                        if self
+                            .db_sender
+                            .send(ProtocolMessage::FinalizeBlock(
+                                block_height,
+                                Block::default(),
+                                fetch_slot,
+                            ))
+                            .is_err()
+                        {
+                            self.report(fetch_slot, Err("database channel closed".to_string()));
+                        }
+                    }
                     ProtocolMessage::ChunkFailed(block_no, fetch_slot, error) => {
                         self.fail_block(block_no, fetch_slot, error);
                     }

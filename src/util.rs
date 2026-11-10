@@ -39,6 +39,10 @@ pub enum ProtocolMessage {
     ChunkFailed(SlotNo, SlotNo, String),
     /// `fetch_slot`, `Ok(())` only after the block is parsed and the writer accepts it.
     BlockProcessingResult(SlotNo, Result<(), String>),
+    /// Durably checkpoint an authoritative skipped slot. No block is stored.
+    RecordSkippedSlot(SlotNo),
+    /// `block_height`, `fetch_slot`. Persist an empty fetched block and its slot checkpoint.
+    StoreEmptyBlock(SlotNo, SlotNo),
 }
 
 impl ProtocolMessage {
