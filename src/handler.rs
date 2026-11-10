@@ -1,14 +1,25 @@
 use crate::error::AggError;
-use crate::util::{Block, ProtocolMessage, UnprocessedBlock};
+use crate::util::{Block, ChunkReject, ProtocolMessage, UnprocessedBlock};
 use log::error;
 use solana_program::clock::Slot;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+const TERMINAL_BLOCK_LIMIT: usize = 1024;
+
+struct PartialBlock {
+    fetch_slot: u64,
+    aggregation: UnprocessedBlock,
+}
 
 pub struct Handler {
     message_receiver: UnboundedReceiver<ProtocolMessage>,
     db_sender: UnboundedSender<ProtocolMessage>,
-    unprocessed_block_collector: HashMap<Slot, UnprocessedBlock>,
+    outcome_sender: Option<UnboundedSender<ProtocolMessage>>,
+    unprocessed_block_collector: HashMap<Slot, PartialBlock>,
+    fetch_slots: HashMap<Slot, u64>,
+    terminal_blocks: HashSet<Slot>,
+    terminal_order: VecDeque<Slot>,
 }
 
 impl Handler {
@@ -30,8 +41,16 @@ impl Handler {
         Self {
             message_receiver,
             db_sender,
+            outcome_sender: None,
             unprocessed_block_collector: HashMap::new(),
+            fetch_slots: HashMap::new(),
+            terminal_blocks: HashSet::new(),
+            terminal_order: VecDeque::new(),
         }
+    }
+
+    pub fn set_block_outcomes(&mut self, sender: UnboundedSender<ProtocolMessage>) {
+        self.outcome_sender = Some(sender);
     }
 
     /// This function runs the handler
@@ -39,12 +58,18 @@ impl Handler {
         loop {
             if let Some(message) = self.message_receiver.recv().await {
                 match message {
+                    ProtocolMessage::ExpectBlock(fetch_slot, block_no, total_chunks) => {
+                        self.fetch_slots.insert(block_no, fetch_slot);
+                        self.note_expected_total(block_no, total_chunks);
+                    }
+                    ProtocolMessage::ChunkFailed(block_no, fetch_slot, error) => {
+                        self.fail_block(block_no, fetch_slot, error);
+                    }
                     ProtocolMessage::ParsedBlock(block_no, total_chunks, chunk_no, block) => {
                         if let Err(err) =
                             self.handle_unprocessed_block(block_no, total_chunks, chunk_no, block)
                         {
                             error!(target: "handler", "Error from handle_unprocessed_block {}", err);
-                            return;
                         }
                     }
                     ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
@@ -88,27 +113,113 @@ impl Handler {
         chunk_no: u64,
         block: Block,
     ) -> Result<(), AggError> {
-        if let Some(unprocessed_block) = self.unprocessed_block_collector.get_mut(&block_no) {
-            let stored_new_chunk = unprocessed_block.insert_chunk(chunk_no, block);
-            if stored_new_chunk && unprocessed_block.is_complete() {
-                let complete_block = unprocessed_block.complete_the_block();
-                self.unprocessed_block_collector.remove(&block_no);
-                self.db_sender
-                    .send(ProtocolMessage::FinalizeBlock(block_no, complete_block))?;
+        if self.terminal_blocks.contains(&block_no) {
+            return Ok(());
+        }
+        let fetch_slot = self.fetch_slots.get(&block_no).copied().unwrap_or(block_no);
+        let mismatched_total = self
+            .unprocessed_block_collector
+            .get(&block_no)
+            .is_some_and(|existing| existing.aggregation.total_chunk_count() != total_chunks);
+        if mismatched_total {
+            self.fail_block(block_no, fetch_slot, "inconsistent chunk count".to_string());
+            return Err(AggError::InvalidChunk);
+        }
+        let stored_new_chunk = {
+            let partial = self
+                .unprocessed_block_collector
+                .entry(block_no)
+                .or_insert_with(|| PartialBlock {
+                    fetch_slot,
+                    aggregation: UnprocessedBlock::new(total_chunks),
+                });
+            partial.aggregation.insert_chunk(chunk_no, block)
+        };
+        match stored_new_chunk {
+            Ok(true)
+                if self
+                    .unprocessed_block_collector
+                    .get(&block_no)
+                    .is_some_and(|partial| partial.aggregation.is_complete()) =>
+            {
+                let partial = self
+                    .unprocessed_block_collector
+                    .remove(&block_no)
+                    .expect("completed block");
+                let complete_block = partial.aggregation.complete_the_block();
+                let fetch_slot = partial.fetch_slot;
+                self.fetch_slots.remove(&block_no);
+                self.remember_terminal(block_no);
+                self.db_sender.send(ProtocolMessage::FinalizeBlock(
+                    block_no,
+                    complete_block,
+                    fetch_slot,
+                ))?;
             }
-        } else {
-            let mut unprocessed_block = UnprocessedBlock::new(total_chunks);
-            let stored_new_chunk = unprocessed_block.insert_chunk(chunk_no, block);
-            if stored_new_chunk && unprocessed_block.is_complete() {
-                let complete_block = unprocessed_block.complete_the_block();
-                self.unprocessed_block_collector.remove(&block_no);
-                self.db_sender
-                    .send(ProtocolMessage::FinalizeBlock(block_no, complete_block))?;
+            Ok(_) => {}
+            Err(ChunkReject::OutOfRange) => {
+                self.fail_block(block_no, fetch_slot, "chunk index out of range".to_string());
+                return Err(AggError::InvalidChunk);
             }
-            self.unprocessed_block_collector
-                .insert(block_no, unprocessed_block);
+            Err(ChunkReject::Conflict) => {
+                self.fail_block(block_no, fetch_slot, "conflicting chunk".to_string());
+                return Err(AggError::ConflictingChunk);
+            }
         }
         Ok(())
+    }
+
+    fn note_expected_total(&mut self, block_no: Slot, total_chunks: u64) {
+        let mismatch = self
+            .unprocessed_block_collector
+            .get(&block_no)
+            .map(|existing| {
+                (
+                    existing.fetch_slot,
+                    existing.aggregation.total_chunk_count() != total_chunks,
+                )
+            });
+        if let Some((fetch_slot, true)) = mismatch {
+            self.fail_block(block_no, fetch_slot, "inconsistent chunk count".to_string());
+        }
+    }
+
+    fn fail_block(&mut self, block_no: Slot, fetch_slot: u64, error: String) {
+        self.unprocessed_block_collector.remove(&block_no);
+        self.fetch_slots.remove(&block_no);
+        if self.remember_terminal(block_no) {
+            self.report(fetch_slot, Err(error));
+        }
+    }
+
+    fn remember_terminal(&mut self, block_no: Slot) -> bool {
+        if !self.terminal_blocks.insert(block_no) {
+            return false;
+        }
+        self.terminal_order.push_back(block_no);
+        while self.terminal_order.len() > TERMINAL_BLOCK_LIMIT {
+            if let Some(old) = self.terminal_order.pop_front() {
+                self.terminal_blocks.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn report(&self, fetch_slot: u64, result: Result<(), String>) {
+        let Some(sender) = &self.outcome_sender else {
+            return;
+        };
+        if sender
+            .send(ProtocolMessage::BlockProcessingResult(fetch_slot, result))
+            .is_err()
+        {
+            error!(target: "handler", "Block outcome receiver is closed");
+        }
+    }
+
+    #[cfg(test)]
+    pub fn has_block_state(&self, block_no: Slot) -> bool {
+        self.unprocessed_block_collector.contains_key(&block_no)
     }
 
     /// This function handles the transaction details
@@ -243,7 +354,7 @@ mod tests {
             .handle_unprocessed_block(7, 1, 0, chunk.clone())
             .expect("first chunk");
         match db_receiver.try_recv() {
-            Ok(ProtocolMessage::FinalizeBlock(slot, _)) => assert_eq!(slot, 7),
+            Ok(ProtocolMessage::FinalizeBlock(slot, _, _)) => assert_eq!(slot, 7),
             other => panic!("expected one finalized block, got {other:?}"),
         }
 
@@ -251,5 +362,110 @@ mod tests {
             .handle_unprocessed_block(7, 1, 0, chunk)
             .expect("duplicate chunk");
         assert!(db_receiver.try_recv().is_err());
+        assert!(!handler.has_block_state(7));
+    }
+
+    #[test]
+    fn out_of_order_chunks_finalize_once_and_clear_state() {
+        let (_incoming_sender, incoming) = unbounded_channel();
+        let (db_sender, mut db_receiver) = unbounded_channel();
+        let mut handler = Handler::initialize(incoming, db_sender);
+        handler
+            .handle_unprocessed_block(4, 2, 1, Block::default())
+            .expect("second index first");
+        assert!(db_receiver.try_recv().is_err());
+        assert!(handler.has_block_state(4));
+        handler
+            .handle_unprocessed_block(4, 2, 0, Block::default())
+            .expect("first index second");
+        match db_receiver.try_recv() {
+            Ok(ProtocolMessage::FinalizeBlock(slot, _, fetch_slot)) => {
+                assert_eq!((slot, fetch_slot), (4, 4));
+            }
+            other => panic!("expected one finalized block, got {other:?}"),
+        }
+        assert!(db_receiver.try_recv().is_err());
+        assert!(!handler.has_block_state(4));
+        handler
+            .handle_unprocessed_block(4, 2, 0, Block::default())
+            .expect("late duplicate");
+        assert!(db_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn conflicting_and_invalid_chunks_fail_without_finalizing() {
+        let (_incoming_sender, incoming) = unbounded_channel();
+        let (db_sender, mut db_receiver) = unbounded_channel();
+        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        let mut handler = Handler::initialize(incoming, db_sender);
+        handler.set_block_outcomes(outcome_sender);
+        handler
+            .handle_unprocessed_block(8, 2, 0, Block::default())
+            .expect("chunk");
+        let mut other = Block::default();
+        other.insert_account("changed".to_string(), 1);
+        let conflict = handler.handle_unprocessed_block(8, 2, 0, other);
+        assert!(matches!(
+            conflict,
+            Err(crate::error::AggError::ConflictingChunk)
+        ));
+        assert!(matches!(
+            outcome_receiver.try_recv(),
+            Ok(ProtocolMessage::BlockProcessingResult(8, Err(_)))
+        ));
+        assert!(!handler.has_block_state(8));
+        handler
+            .handle_unprocessed_block(8, 2, 1, Block::default())
+            .expect("ignored after failure");
+        assert!(db_receiver.try_recv().is_err());
+
+        let range = handler.handle_unprocessed_block(9, 1, 3, Block::default());
+        assert!(matches!(range, Err(crate::error::AggError::InvalidChunk)));
+        assert!(db_receiver.try_recv().is_err());
+
+        handler
+            .handle_unprocessed_block(10, 2, 0, Block::default())
+            .expect("first total");
+        let mismatch = handler.handle_unprocessed_block(10, 3, 1, Block::default());
+        assert!(matches!(
+            mismatch,
+            Err(crate::error::AggError::InvalidChunk)
+        ));
+        assert!(db_receiver.try_recv().is_err());
+        assert!(!handler.has_block_state(10));
+    }
+
+    #[test]
+    fn incomplete_block_does_not_finalize() {
+        let (_incoming_sender, incoming) = unbounded_channel();
+        let (db_sender, mut db_receiver) = unbounded_channel();
+        let mut handler = Handler::initialize(incoming, db_sender);
+        handler
+            .handle_unprocessed_block(3, 2, 0, Block::default())
+            .expect("only chunk");
+        assert!(db_receiver.try_recv().is_err());
+        assert!(handler.has_block_state(3));
+    }
+
+    #[test]
+    fn parser_chunk_failure_prevents_completion() {
+        let (_incoming_sender, incoming) = unbounded_channel();
+        let (db_sender, mut db_receiver) = unbounded_channel();
+        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        let mut handler = Handler::initialize(incoming, db_sender);
+        handler.set_block_outcomes(outcome_sender);
+        handler
+            .handle_unprocessed_block(11, 2, 0, Block::default())
+            .expect("partial");
+        handler.fail_block(11, 77, "parser failed".to_string());
+        assert!(matches!(
+            outcome_receiver.try_recv(),
+            Ok(ProtocolMessage::BlockProcessingResult(77, Err(_)))
+        ));
+        handler
+            .handle_unprocessed_block(11, 2, 1, Block::default())
+            .expect("late chunk after failure");
+        assert!(db_receiver.try_recv().is_err());
+        assert!(!handler.has_block_state(11));
     }
 }

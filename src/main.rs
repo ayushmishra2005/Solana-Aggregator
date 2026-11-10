@@ -3,6 +3,7 @@ use crate::cli::Cli;
 use crate::util::{Channel, ProtocolMessage};
 use log::error;
 use structopt::StructOpt;
+use tokio::sync::mpsc::unbounded_channel;
 
 mod block_importer;
 mod builder;
@@ -19,6 +20,7 @@ async fn main() {
     let opt: Cli = Cli::from_args();
     let handler_channel = Channel::<ProtocolMessage>::new();
     let db_channel = Channel::<ProtocolMessage>::new();
+    let (block_outcome_sender, block_outcome_receiver) = unbounded_channel();
     let handler_channel_receiver_server = handler_channel.sender();
     let mut subscriber_client = match Builder::default()
         .chain_url(opt.chain_url)
@@ -31,10 +33,12 @@ async fn main() {
             return;
         }
     };
+    subscriber_client.set_block_outcomes(block_outcome_sender.clone(), block_outcome_receiver);
     let mut handler = Builder::default()
         .db_sender(db_channel.sender())
         .router_receiver(handler_channel.receiver)
         .build();
+    handler.set_block_outcomes(block_outcome_sender.clone());
     let mut db_client = match Builder::default()
         .db_path(opt.db_path)
         .db_receiver(db_channel.receiver)
@@ -46,6 +50,7 @@ async fn main() {
             return;
         }
     };
+    db_client.set_block_outcomes(block_outcome_sender);
     tokio::spawn(async move {
         db_client.run().await;
     });

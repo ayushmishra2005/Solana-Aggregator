@@ -21,7 +21,7 @@ pub enum ProtocolMessage {
         UnboundedSender<Self>,
     ),
     ParsedBlock(SlotNo, TotalChunk, ChunkNo, Block),
-    FinalizeBlock(SlotNo, Block),
+    FinalizeBlock(SlotNo, Block, SlotNo),
     FetchTransactionDetails(String, UnboundedSender<Self>),
     TxDetails(TxRecord),
     FetchBlockDetails(String, UnboundedSender<Self>),
@@ -33,6 +33,12 @@ pub enum ProtocolMessage {
     FetchAccountBalance(String, Option<u64>, UnboundedSender<Self>),
     AccountBalance(u64),
     Error(String),
+    /// `fetch_slot`, `block_height`, `total_chunks`.
+    ExpectBlock(SlotNo, SlotNo, TotalChunk),
+    /// `block_height`, `fetch_slot`, sanitized error.
+    ChunkFailed(SlotNo, SlotNo, String),
+    /// `fetch_slot`, `Ok(())` only after the block is parsed and the writer accepts it.
+    BlockProcessingResult(SlotNo, Result<(), String>),
 }
 
 impl ProtocolMessage {
@@ -60,7 +66,7 @@ impl ProtocolMessage {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub enum Instruction {
     Transfer(String, String, f64),
 }
@@ -71,7 +77,7 @@ impl Instruction {
     }
 }
 
-#[derive(Default, Clone, Serialize, Deserialize, Debug)]
+#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct TxRecord {
     instruction: Vec<Instruction>,
     metadata: Option<String>,
@@ -87,7 +93,7 @@ impl TxRecord {
     }
 }
 
-#[derive(Default, Clone, Serialize, Deserialize, Debug)]
+#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Block {
     tx_map: HashMap<String, TxRecord>,
     account_map: Option<BTreeMap<String, u64>>,
@@ -133,6 +139,12 @@ impl Block {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChunkReject {
+    OutOfRange,
+    Conflict,
+}
+
 #[derive(Default)]
 pub struct UnprocessedBlock {
     total_chunks: u64,
@@ -153,15 +165,26 @@ impl UnprocessedBlock {
         self.total_chunks == self.total_collected_chunks
     }
 
-    /// Stores a valid chunk index. Returns whether this index was not already present.
-    pub fn insert_chunk(&mut self, chunk_no: ChunkNo, block: Block) -> bool {
-        if chunk_no >= self.total_chunks {
-            return false;
+    pub fn total_chunk_count(&self) -> u64 {
+        self.total_chunks
+    }
+
+    /// Stores a valid chunk index.
+    ///
+    /// An identical repeat is ignored. A different payload for the same index is rejected.
+    pub fn insert_chunk(&mut self, chunk_no: ChunkNo, block: Block) -> Result<bool, ChunkReject> {
+        if self.total_chunks == 0 || chunk_no >= self.total_chunks {
+            return Err(ChunkReject::OutOfRange);
         }
-        let stored_new_chunk = !self.collected_partial_blocks.contains_key(&chunk_no);
+        if let Some(existing) = self.collected_partial_blocks.get(&chunk_no) {
+            if existing == &block {
+                return Ok(false);
+            }
+            return Err(ChunkReject::Conflict);
+        }
         self.collected_partial_blocks.insert(chunk_no, block);
         self.total_collected_chunks = self.collected_partial_blocks.len() as u64;
-        stored_new_chunk
+        Ok(true)
     }
 
     pub fn complete_the_block(&self) -> Block {
@@ -222,7 +245,9 @@ mod tests {
         let mut block = UnprocessedBlock::new(total_chunks);
         let mut completed = Vec::with_capacity(chunks.len());
         for &(chunk_no, balance) in chunks {
-            block.insert_chunk(chunk_no, partial(chunk_no, balance));
+            block
+                .insert_chunk(chunk_no, partial(chunk_no, balance))
+                .expect("identical chunk");
             completed.push(block.is_complete());
         }
         (block, completed)
@@ -292,5 +317,30 @@ mod tests {
         assert_eq!(merged.get_account_balance("chunk-1"), Some(2));
         assert_eq!(merged.get_account_balance("chunk-2"), Some(3));
         assert_eq!(merged.get_account_balance("merged"), Some(3));
+    }
+
+    #[test]
+    fn conflicting_duplicate_chunk_is_rejected() {
+        let mut block = UnprocessedBlock::new(2);
+        block.insert_chunk(0, partial(0, 1)).expect("first chunk");
+        assert!(matches!(
+            block.insert_chunk(0, partial(0, 9)),
+            Err(super::ChunkReject::Conflict)
+        ));
+        assert!(!block.is_complete());
+        assert_eq!(
+            block.complete_the_block().get_account_balance("chunk-0"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn out_of_range_chunk_is_rejected() {
+        let mut block = UnprocessedBlock::new(2);
+        assert!(matches!(
+            block.insert_chunk(2, partial(2, 1)),
+            Err(super::ChunkReject::OutOfRange)
+        ));
+        assert!(!block.is_complete());
     }
 }

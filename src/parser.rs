@@ -59,12 +59,15 @@ impl Parser {
                 };
                 let message = &transaction.message;
                 let meta = tx.meta.as_ref();
-                for (_, instruction) in message.instructions().iter().enumerate() {
-                    if Self::is_transfer_instruction(message, instruction, meta)? {
-                        instructions.push(
-                            Self::decode_transfer_instruction(message, instruction, meta)?
-                                .instruction(),
-                        );
+                let execution_failed = meta.and_then(|meta| meta.err.as_ref()).is_some();
+                if !execution_failed {
+                    for (_, instruction) in message.instructions().iter().enumerate() {
+                        if Self::is_transfer_instruction(message, instruction, meta)? {
+                            instructions.push(
+                                Self::decode_transfer_instruction(message, instruction, meta)?
+                                    .instruction(),
+                            );
+                        }
                     }
                 }
                 if let Some(meta) = tx.meta.clone() {
@@ -330,6 +333,41 @@ mod tests {
             Parser::decode_transfer_instruction(message, instruction, None),
             Err(AggError::InvalidTransferInstruction)
         ));
+    }
+
+    #[test]
+    fn failed_transaction_keeps_balances_without_a_transfer() {
+        let source = Keypair::new();
+        let destination = account(12);
+        let lamports = 1_000_000_000;
+        let instruction = system_instruction::transfer(&source.pubkey(), &destination, lamports);
+        let message = Message::new(&[instruction], Some(&source.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&source], Hash::new_from_array([7; 32]))
+            .expect("sign failed transfer");
+        let versioned = VersionedTransaction::from(transaction);
+        let mut meta = balances_meta(vec![9, 8, 1]);
+        meta.err = Some(solana_sdk::transaction::TransactionError::InsufficientFundsForFee);
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(meta),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let signature = versioned.signatures[0].to_string();
+        let block = parse_accounts(encoded);
+        let value = transfer_json(&block, &signature);
+        assert_eq!(value["instruction"], serde_json::json!([]));
+        assert!(block
+            .get_account_balance(&source.pubkey().to_string())
+            .is_some());
+        assert!(value["metadata"]
+            .as_str()
+            .expect("metadata")
+            .contains("InsufficientFundsForFee"));
     }
 
     #[test]

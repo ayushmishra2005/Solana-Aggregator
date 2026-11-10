@@ -10,7 +10,9 @@ const LATEST_BLOCK_NO_KEY: &str = "lst_blk_no";
 pub struct RocksDb {
     db: rocksdb::DB,
     receiver: UnboundedReceiver<ProtocolMessage>,
+    outcome_sender: Option<UnboundedSender<ProtocolMessage>>,
     temp_db: BTreeSet<u64>,
+    fail_next_write: bool,
 }
 
 impl RocksDb {
@@ -33,8 +35,19 @@ impl RocksDb {
         Ok(Self {
             db,
             receiver,
+            outcome_sender: None,
             temp_db: Default::default(),
+            fail_next_write: false,
         })
+    }
+
+    pub fn set_block_outcomes(&mut self, sender: UnboundedSender<ProtocolMessage>) {
+        self.outcome_sender = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub fn inject_write_failure(&mut self) {
+        self.fail_next_write = true;
     }
 
     /// This function runs the RocksDb client
@@ -42,15 +55,17 @@ impl RocksDb {
         loop {
             if let Some(message) = self.receiver.recv().await {
                 match message {
-                    ProtocolMessage::FinalizeBlock(block_no, block) => {
+                    ProtocolMessage::FinalizeBlock(block_no, block, fetch_slot) => {
                         println!(
                             "here block no {:?} {:?}",
                             block_no,
                             block.get_tx_hash().len()
                         );
-                        if let Err(err) = self.handle_block(block_no, block) {
+                        let result = self.handle_block(block_no, block);
+                        if let Err(err) = &result {
                             error!(target: "db", "Error from handle_block {}", err);
                         }
+                        self.report_block(fetch_slot, result);
                     }
                     ProtocolMessage::FetchTransactionDetails(tx_id, server_sender) => {
                         println!("Fetching tx details {:?}", tx_id);
@@ -262,7 +277,24 @@ impl RocksDb {
     /// # Returns
     ///
     /// * `Result<(), AggError>` - A Result that holds the result or an error
+    fn report_block(&self, fetch_slot: u64, result: Result<(), AggError>) {
+        let Some(sender) = &self.outcome_sender else {
+            return;
+        };
+        let message = ProtocolMessage::BlockProcessingResult(
+            fetch_slot,
+            result.map_err(|err| err.to_string()),
+        );
+        if sender.send(message).is_err() {
+            error!(target: "db", "Block outcome receiver is closed");
+        }
+    }
+
     fn handle_block(&mut self, block_no: u64, block: Block) -> Result<(), AggError> {
+        if self.fail_next_write {
+            self.fail_next_write = false;
+            return Err(AggError::WriteFailed);
+        }
         if let Some(latest_block) = self.get_latest_block() {
             debug!("Latest block no {:?}", latest_block);
             if block_no == latest_block.saturating_add(1) {
@@ -619,5 +651,55 @@ mod tests {
         .expect_err("invalid transaction");
         assert!(matches!(error, AggError::InvalidTransactionSignature));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn database_write_failure_reports_the_fetch_slot() {
+        let dir = TempDir::new();
+        let (_sender, receiver) = unbounded_channel();
+        let mut db = RocksDb::initialize(dir.path.to_string_lossy().to_string(), receiver)
+            .expect("database");
+        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        db.set_block_outcomes(outcome_sender);
+        db.inject_write_failure();
+        let result = db.handle_block(4, crate::util::Block::default());
+        db.report_block(15, result);
+        match outcome_receiver.try_recv() {
+            Ok(ProtocolMessage::BlockProcessingResult(15, Err(message))) => {
+                assert!(message.contains("Block write failed"), "{message}");
+            }
+            other => panic!("expected a write failure for slot 15, got {other:?}"),
+        }
+        assert!(db.get_block(4).is_none());
+    }
+
+    #[test]
+    fn database_write_success_reports_the_fetch_slot() {
+        let dir = TempDir::new();
+        let (_sender, receiver) = unbounded_channel();
+        let mut db = RocksDb::initialize(dir.path.to_string_lossy().to_string(), receiver)
+            .expect("database");
+        let (outcome_sender, mut outcome_receiver) = unbounded_channel();
+        db.set_block_outcomes(outcome_sender);
+        let mut block = crate::util::Block::default();
+        block.push_transaction(
+            solana_sdk::signature::Signature::from([4; 64]),
+            crate::util::TxRecord::default(),
+        );
+        let result = db.handle_block(4, block);
+        db.report_block(15, result);
+        assert!(matches!(
+            outcome_receiver.try_recv(),
+            Ok(ProtocolMessage::BlockProcessingResult(15, Ok(())))
+        ));
+        let signature = solana_sdk::signature::Signature::from([4; 64]).to_string();
+        let (server_sender, mut server_receiver) = unbounded_channel();
+        db.handle_tx_request(signature.clone(), server_sender)
+            .expect("signature lookup");
+        assert!(matches!(
+            server_receiver.try_recv(),
+            Ok(ProtocolMessage::TxDetails(_))
+        ));
+        assert!(db.get_block(4).is_some());
     }
 }

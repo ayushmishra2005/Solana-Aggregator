@@ -20,6 +20,9 @@ pub enum AggError {
     InvalidTransactionSignature,
     InvalidTransferInstruction,
     InvalidBalanceMetadata,
+    InvalidChunk,
+    ConflictingChunk,
+    WriteFailed,
 }
 
 impl Display for AggError {
@@ -40,6 +43,9 @@ impl Display for AggError {
                 "Invalid system transfer instruction".to_string()
             }
             AggError::InvalidBalanceMetadata => "Invalid balance metadata".to_string(),
+            AggError::InvalidChunk => "Invalid block chunk".to_string(),
+            AggError::ConflictingChunk => "Conflicting block chunk".to_string(),
+            AggError::WriteFailed => "Block write failed".to_string(),
             AggError::ServerError(err) => format!("Server Error {}", err),
         };
         write!(f, "{}", err_mgs)
@@ -66,6 +72,9 @@ impl Debug for AggError {
                 "Invalid system transfer instruction".to_string()
             }
             AggError::InvalidBalanceMetadata => "Invalid balance metadata".to_string(),
+            AggError::InvalidChunk => "Invalid block chunk".to_string(),
+            AggError::ConflictingChunk => "Conflicting block chunk".to_string(),
+            AggError::WriteFailed => "Block write failed".to_string(),
             AggError::ServerError(err) => format!("Server Error {:?}", err),
         };
         write!(f, "{}", err_mgs)
