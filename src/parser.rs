@@ -5,6 +5,9 @@ use solana_program::instruction::CompiledInstruction;
 use solana_program::message::VersionedMessage;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_program;
+use solana_transaction_status::option_serializer::OptionSerializer;
+use solana_transaction_status::UiTransactionStatusMeta;
+use std::str::FromStr;
 
 const SYSTEM_TRANSFER_DISCRIMINANT: u32 = 2;
 const SYSTEM_TRANSFER_DATA_LEN: usize = 12;
@@ -40,12 +43,8 @@ impl Parser {
                     }
                 }
                 if let Some(meta) = tx.meta.clone() {
-                    Self::record_observed_balances(
-                        &mut partial_block,
-                        message.static_account_keys(),
-                        &meta.post_balances,
-                    )
-                    .map_err(|()| AggError::InvalidBalanceMetadata)?;
+                    Self::record_observed_balances(&mut partial_block, message, &meta)
+                        .map_err(|()| AggError::InvalidBalanceMetadata)?;
                 }
                 partial_block
                     .push_transaction(signature, TxRecord::new(instructions, tx.meta.clone()));
@@ -135,20 +134,64 @@ impl Parser {
         Ok(Some(u64::from_le_bytes(lamports)))
     }
 
-    /// Records every static-account balance.
-    /// `post_balances` must cover every static account key.
+    /// Records a post-balance for every resolved account.
+    /// Legacy accounts are the static keys. V0 accounts continue with loaded
+    /// writable addresses and then loaded readonly addresses.
     fn record_observed_balances(
         block: &mut Block,
-        static_keys: &[Pubkey],
-        post_balances: &[u64],
+        message: &VersionedMessage,
+        meta: &UiTransactionStatusMeta,
     ) -> Result<(), ()> {
-        if post_balances.len() < static_keys.len() {
+        let mut accounts = message.static_account_keys().to_vec();
+        accounts.extend(Self::loaded_account_keys(message, meta)?);
+        if meta.post_balances.len() < accounts.len() {
             return Err(());
         }
-        for (key, balance) in static_keys.iter().zip(post_balances.iter()) {
+        for (key, balance) in accounts.iter().zip(meta.post_balances.iter()) {
             block.insert_account(key.to_string(), *balance);
         }
         Ok(())
+    }
+
+    fn loaded_account_keys(
+        message: &VersionedMessage,
+        meta: &UiTransactionStatusMeta,
+    ) -> Result<Vec<Pubkey>, ()> {
+        let (writable_count, readonly_count) = message
+            .address_table_lookups()
+            .map(|lookups| {
+                lookups
+                    .iter()
+                    .fold((0usize, 0usize), |(writable, readonly), lookup| {
+                        (
+                            writable.saturating_add(lookup.writable_indexes.len()),
+                            readonly.saturating_add(lookup.readonly_indexes.len()),
+                        )
+                    })
+            })
+            .unwrap_or((0, 0));
+        let loaded = match &meta.loaded_addresses {
+            OptionSerializer::Some(addresses) => Some(addresses),
+            OptionSerializer::None | OptionSerializer::Skip => None,
+        };
+        let Some(loaded) = loaded else {
+            if writable_count == 0 && readonly_count == 0 {
+                return Ok(Vec::new());
+            }
+            return Err(());
+        };
+        if loaded.writable.len() != writable_count || loaded.readonly.len() != readonly_count {
+            return Err(());
+        }
+        let mut keys = Self::parse_loaded_pubkeys(&loaded.writable)?;
+        keys.extend(Self::parse_loaded_pubkeys(&loaded.readonly)?);
+        Ok(keys)
+    }
+
+    fn parse_loaded_pubkeys(keys: &[String]) -> Result<Vec<Pubkey>, ()> {
+        keys.iter()
+            .map(|key| Pubkey::from_str(key).map_err(|_| ()))
+            .collect()
     }
 
     fn transfer_account(
@@ -168,15 +211,17 @@ mod tests {
     use crate::util::{Block, Instruction, ProtocolMessage};
     use solana_program::hash::Hash;
     use solana_program::instruction::CompiledInstruction;
+    use solana_program::message::v0::{self, MessageAddressTableLookup};
     use solana_program::message::{Message, MessageHeader, VersionedMessage};
     use solana_program::pubkey::Pubkey;
     use solana_program::system_instruction::{self, SystemInstruction};
     use solana_program::system_program;
     use solana_sdk::signature::{Keypair, Signature, Signer};
     use solana_sdk::transaction::{Transaction, TransactionVersion, VersionedTransaction};
+    use solana_transaction_status::option_serializer::OptionSerializer;
     use solana_transaction_status::{
         EncodableWithMeta, EncodedTransactionWithStatusMeta, TransactionStatusMeta,
-        UiTransactionEncoding, UiTransactionStatusMeta,
+        UiLoadedAddresses, UiTransactionEncoding, UiTransactionStatusMeta,
     };
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -426,7 +471,18 @@ mod tests {
     #[test]
     fn zero_static_account_keys_record_nothing() {
         let mut block = Block::default();
-        Parser::record_observed_balances(&mut block, &[], &[]).expect("empty account list");
+        let message = VersionedMessage::Legacy(Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![],
+            recent_blockhash: Hash::new_from_array([0; 32]),
+            instructions: vec![],
+        });
+        Parser::record_observed_balances(&mut block, &message, &balances_meta(vec![]))
+            .expect("empty account list");
         assert!(block.get_account_map().is_none());
     }
 
@@ -635,6 +691,261 @@ mod tests {
             .is_some());
         assert!(block
             .get_tx_details(&Signature::from([5; 64]).to_string())
+            .is_some());
+    }
+
+    fn v0_encoded(
+        static_keys: Vec<Pubkey>,
+        writable: Vec<Pubkey>,
+        readonly: Vec<Pubkey>,
+        post_balances: Vec<u64>,
+        signature_byte: u8,
+        loaded: Option<Option<UiLoadedAddresses>>,
+    ) -> EncodedTransactionWithStatusMeta {
+        let address_table_lookups = if writable.is_empty() && readonly.is_empty() {
+            Vec::new()
+        } else {
+            vec![MessageAddressTableLookup {
+                account_key: account(99),
+                writable_indexes: (0..writable.len() as u8).collect(),
+                readonly_indexes: (0..readonly.len() as u8).collect(),
+            }]
+        };
+        let versioned = VersionedTransaction {
+            signatures: vec![Signature::from([signature_byte; 64])],
+            message: VersionedMessage::V0(v0::Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: static_keys.len().saturating_sub(1) as u8,
+                },
+                account_keys: static_keys,
+                recent_blockhash: Hash::new_from_array([2; 32]),
+                instructions: vec![],
+                address_table_lookups,
+            }),
+        };
+        let mut meta = balances_meta(post_balances);
+        meta.loaded_addresses = match loaded {
+            None => OptionSerializer::Skip,
+            Some(None) => OptionSerializer::None,
+            Some(Some(addresses)) => OptionSerializer::Some(addresses),
+        };
+        EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(meta),
+            version: Some(TransactionVersion::Number(0)),
+        }
+    }
+
+    fn loaded(writable: &[Pubkey], readonly: &[Pubkey]) -> UiLoadedAddresses {
+        UiLoadedAddresses {
+            writable: writable.iter().map(ToString::to_string).collect(),
+            readonly: readonly.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn legacy_transaction_records_static_balances_only() {
+        let first = account(1);
+        let second = account(2);
+        let block = parse_accounts(encoded_accounts(vec![first, second], Some(vec![4, 5])));
+        assert_eq!(block.get_account_balance(&first.to_string()), Some(4));
+        assert_eq!(block.get_account_balance(&second.to_string()), Some(5));
+        assert_eq!(block.get_account_map().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn v0_without_loaded_addresses_records_static_balances() {
+        let first = account(1);
+        let second = account(2);
+        let block = parse_accounts(v0_encoded(
+            vec![first, second],
+            vec![],
+            vec![],
+            vec![4, 5],
+            11,
+            None,
+        ));
+        assert_eq!(block.get_account_balance(&first.to_string()), Some(4));
+        assert_eq!(block.get_account_balance(&second.to_string()), Some(5));
+        assert_eq!(block.get_account_map().unwrap().len(), 2);
+        assert!(block
+            .get_tx_details(&Signature::from([11; 64]).to_string())
+            .is_some());
+    }
+
+    #[test]
+    fn v0_loaded_writable_address_is_indexed() {
+        let payer = account(1);
+        let writable = account(2);
+        let block = parse_accounts(v0_encoded(
+            vec![payer],
+            vec![writable],
+            vec![],
+            vec![10, u64::MAX],
+            12,
+            Some(Some(loaded(&[writable], &[]))),
+        ));
+        assert_eq!(block.get_account_balance(&payer.to_string()), Some(10));
+        assert_eq!(
+            block.get_account_balance(&writable.to_string()),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn v0_loaded_readonly_address_is_indexed() {
+        let payer = account(1);
+        let readonly = account(3);
+        let block = parse_accounts(v0_encoded(
+            vec![payer],
+            vec![],
+            vec![readonly],
+            vec![10, 77],
+            13,
+            Some(Some(loaded(&[], &[readonly]))),
+        ));
+        assert_eq!(block.get_account_balance(&readonly.to_string()), Some(77));
+    }
+
+    #[test]
+    fn v0_loaded_addresses_follow_static_writable_readonly_order() {
+        let payer = account(1);
+        let writable_a = account(2);
+        let writable_b = account(3);
+        let readonly_a = account(4);
+        let readonly_b = account(5);
+        let balances = vec![11, 22, 33, 44, u64::MAX];
+        let block = parse_accounts(v0_encoded(
+            vec![payer],
+            vec![writable_a, writable_b],
+            vec![readonly_a, readonly_b],
+            balances.clone(),
+            14,
+            Some(Some(loaded(
+                &[writable_a, writable_b],
+                &[readonly_a, readonly_b],
+            ))),
+        ));
+        let keys = [payer, writable_a, writable_b, readonly_a, readonly_b];
+        for (key, balance) in keys.iter().zip(balances.iter()) {
+            assert_eq!(block.get_account_balance(&key.to_string()), Some(*balance));
+        }
+        assert_eq!(block.get_account_map().unwrap().len(), 5);
+        assert!(block
+            .get_tx_details(&Signature::from([14; 64]).to_string())
+            .is_some());
+    }
+
+    #[test]
+    fn missing_loaded_address_metadata_is_rejected() {
+        assert_balance_error(v0_encoded(
+            vec![account(1)],
+            vec![account(2)],
+            vec![],
+            vec![1, 2],
+            15,
+            None,
+        ));
+        assert_balance_error(v0_encoded(
+            vec![account(1)],
+            vec![account(2)],
+            vec![],
+            vec![1, 2],
+            16,
+            Some(None),
+        ));
+    }
+
+    #[test]
+    fn loaded_address_count_mismatch_is_rejected() {
+        let payer = account(1);
+        let writable = account(2);
+        let mut encoded = v0_encoded(
+            vec![payer],
+            vec![writable],
+            vec![],
+            vec![1, 2],
+            17,
+            Some(Some(loaded(&[writable, account(3)], &[]))),
+        );
+        encoded.meta.as_mut().unwrap().post_balances = vec![1, 2, 3];
+        assert_balance_error(encoded);
+    }
+
+    #[test]
+    fn missing_post_balance_for_loaded_account_is_rejected() {
+        assert_balance_error(v0_encoded(
+            vec![account(1)],
+            vec![account(2)],
+            vec![account(3)],
+            vec![1, 2],
+            18,
+            Some(Some(loaded(&[account(2)], &[account(3)]))),
+        ));
+    }
+
+    #[test]
+    fn malformed_loaded_public_key_is_rejected() {
+        let mut addresses = loaded(&[account(2)], &[]);
+        addresses.writable = vec!["not-a-solana-public-key".to_string()];
+        assert_balance_error(v0_encoded(
+            vec![account(1)],
+            vec![account(2)],
+            vec![],
+            vec![1, 2],
+            19,
+            Some(Some(addresses)),
+        ));
+    }
+
+    #[test]
+    fn later_loaded_account_observation_replaces_the_earlier_balance() {
+        let payer = account(1);
+        let loaded_account = account(2);
+        let first = v0_encoded(
+            vec![payer],
+            vec![loaded_account],
+            vec![],
+            vec![5, 10],
+            20,
+            Some(Some(loaded(&[loaded_account], &[]))),
+        );
+        let second = v0_encoded(
+            vec![payer],
+            vec![loaded_account],
+            vec![],
+            vec![6, 99],
+            21,
+            Some(Some(loaded(&[loaded_account], &[]))),
+        );
+        let (sender, mut receiver) = unbounded_channel();
+        block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            9,
+            0,
+            1,
+            vec![first, second],
+            sender,
+        )))
+        .expect("parse v0 transactions");
+        let block = match receiver.try_recv().expect("parsed block") {
+            ProtocolMessage::ParsedBlock(_, _, _, block) => block,
+            other => panic!("expected a parsed block, got {other:?}"),
+        };
+        assert_eq!(block.get_account_balance(&payer.to_string()), Some(6));
+        assert_eq!(
+            block.get_account_balance(&loaded_account.to_string()),
+            Some(99)
+        );
+        assert!(block
+            .get_tx_details(&Signature::from([20; 64]).to_string())
+            .is_some());
+        assert!(block
+            .get_tx_details(&Signature::from([21; 64]).to_string())
             .is_some());
     }
 }
