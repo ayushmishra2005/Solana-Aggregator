@@ -12,6 +12,11 @@ use std::str::FromStr;
 const SYSTEM_TRANSFER_DISCRIMINANT: u32 = 2;
 const SYSTEM_TRANSFER_DATA_LEN: usize = 12;
 
+enum AccountLookup {
+    OutOfRange,
+    Metadata,
+}
+
 pub struct Parser;
 
 impl Parser {
@@ -37,9 +42,14 @@ impl Parser {
                     return Err(AggError::InvalidTransactionSignature);
                 };
                 let message = &transaction.message;
+                let meta = tx.meta.as_ref();
                 for (_, instruction) in message.instructions().iter().enumerate() {
-                    if Self::is_transfer_instruction(message, instruction)? {
-                        instructions.push(Self::decode_transfer_instruction(message, instruction)?);
+                    if Self::is_transfer_instruction(message, instruction, meta)? {
+                        instructions.push(Self::decode_transfer_instruction(
+                            message,
+                            instruction,
+                            meta,
+                        )?);
                     }
                 }
                 if let Some(meta) = tx.meta.clone() {
@@ -62,11 +72,9 @@ impl Parser {
     fn is_transfer_instruction(
         message: &VersionedMessage,
         instruction: &CompiledInstruction,
+        meta: Option<&UiTransactionStatusMeta>,
     ) -> Result<bool, AggError> {
-        let Some(is_system_program) = Self::is_system_program(message, instruction) else {
-            return Err(AggError::InvalidTransferInstruction);
-        };
-        if !is_system_program {
+        if !Self::is_system_program(message, instruction, meta).map_err(Self::lookup_error)? {
             return Ok(false);
         }
         match Self::transfer_lamports(&instruction.data) {
@@ -78,11 +86,9 @@ impl Parser {
     fn decode_transfer_instruction(
         message: &VersionedMessage,
         instruction: &CompiledInstruction,
+        meta: Option<&UiTransactionStatusMeta>,
     ) -> Result<Instruction, AggError> {
-        let Some(is_system_program) = Self::is_system_program(message, instruction) else {
-            return Err(AggError::InvalidTransferInstruction);
-        };
-        if !is_system_program {
+        if !Self::is_system_program(message, instruction, meta).map_err(Self::lookup_error)? {
             return Err(AggError::InvalidTransferInstruction);
         }
         let Some(lamports) = Self::transfer_lamports(&instruction.data)
@@ -90,10 +96,18 @@ impl Parser {
         else {
             return Err(AggError::InvalidTransferInstruction);
         };
-        let from = Self::transfer_account(message, instruction, 0)
-            .ok_or(AggError::InvalidTransferInstruction)?;
-        let to = Self::transfer_account(message, instruction, 1)
-            .ok_or(AggError::InvalidTransferInstruction)?;
+        let from = Self::account_at(
+            message,
+            meta,
+            Self::operand_index(instruction, 0).map_err(Self::lookup_error)?,
+        )
+        .map_err(Self::lookup_error)?;
+        let to = Self::account_at(
+            message,
+            meta,
+            Self::operand_index(instruction, 1).map_err(Self::lookup_error)?,
+        )
+        .map_err(Self::lookup_error)?;
         let amount = lamports as f64 / 1_000_000_000.0;
 
         debug!(
@@ -108,11 +122,49 @@ impl Parser {
     fn is_system_program(
         message: &VersionedMessage,
         instruction: &CompiledInstruction,
-    ) -> Option<bool> {
-        let program_id = message
-            .static_account_keys()
-            .get(instruction.program_id_index as usize)?;
-        Some(*program_id == system_program::id())
+        meta: Option<&UiTransactionStatusMeta>,
+    ) -> Result<bool, AccountLookup> {
+        let program_id = Self::account_at(message, meta, instruction.program_id_index as usize)?;
+        Ok(program_id == system_program::id())
+    }
+
+    fn operand_index(
+        instruction: &CompiledInstruction,
+        operand: usize,
+    ) -> Result<usize, AccountLookup> {
+        instruction
+            .accounts
+            .get(operand)
+            .copied()
+            .map(usize::from)
+            .ok_or(AccountLookup::OutOfRange)
+    }
+
+    fn account_at(
+        message: &VersionedMessage,
+        meta: Option<&UiTransactionStatusMeta>,
+        index: usize,
+    ) -> Result<Pubkey, AccountLookup> {
+        let static_keys = message.static_account_keys();
+        if let Some(key) = static_keys.get(index) {
+            return Ok(*key);
+        }
+        let Some(meta) = meta else {
+            return Err(AccountLookup::OutOfRange);
+        };
+        let loaded =
+            Self::loaded_account_keys(message, meta).map_err(|()| AccountLookup::Metadata)?;
+        loaded
+            .get(index - static_keys.len())
+            .copied()
+            .ok_or(AccountLookup::OutOfRange)
+    }
+
+    fn lookup_error(error: AccountLookup) -> AggError {
+        match error {
+            AccountLookup::OutOfRange => AggError::InvalidTransferInstruction,
+            AccountLookup::Metadata => AggError::InvalidBalanceMetadata,
+        }
     }
 
     /// `Ok(None)` means the data is not a System `Transfer`.
@@ -194,14 +246,6 @@ impl Parser {
             .collect()
     }
 
-    fn transfer_account(
-        message: &VersionedMessage,
-        instruction: &CompiledInstruction,
-        operand: usize,
-    ) -> Option<Pubkey> {
-        let index = instruction.accounts.get(operand).copied()?;
-        message.static_account_keys().get(index as usize).copied()
-    }
 }
 
 #[cfg(test)]
@@ -269,7 +313,7 @@ mod tests {
 
     fn assert_rejected(message: &VersionedMessage, instruction: &CompiledInstruction) {
         assert!(matches!(
-            Parser::decode_transfer_instruction(message, instruction),
+            Parser::decode_transfer_instruction(message, instruction, None),
             Err(AggError::InvalidTransferInstruction)
         ));
     }
@@ -280,8 +324,8 @@ mod tests {
         let instruction = valid_transfer_instruction();
         assert_eq!(instruction.data.len(), 12);
         assert_eq!(&instruction.data[..4], &[2, 0, 0, 0]);
-        assert!(Parser::is_transfer_instruction(&message, &instruction).unwrap());
-        let decoded = Parser::decode_transfer_instruction(&message, &instruction).unwrap();
+        assert!(Parser::is_transfer_instruction(&message, &instruction, None).unwrap());
+        let decoded = Parser::decode_transfer_instruction(&message, &instruction, None).unwrap();
         let expected = Instruction::transfer(from, to, LAMPORTS as f64 / 1_000_000_000.0);
         assert_eq!(
             serde_json::to_value(decoded).unwrap(),
@@ -293,7 +337,7 @@ mod tests {
     fn empty_instruction_data_is_not_a_transfer() {
         let (_from, _to, message) = transfer_keys();
         let instruction = transfer_instruction(vec![0, 1], vec![]);
-        assert!(!Parser::is_transfer_instruction(&message, &instruction).unwrap());
+        assert!(!Parser::is_transfer_instruction(&message, &instruction, None).unwrap());
         assert_rejected(&message, &instruction);
     }
 
@@ -301,7 +345,7 @@ mod tests {
     fn truncated_discriminant_is_not_a_transfer() {
         let (_from, _to, message) = transfer_keys();
         let instruction = transfer_instruction(vec![0, 1], vec![2, 0, 0]);
-        assert!(!Parser::is_transfer_instruction(&message, &instruction).unwrap());
+        assert!(!Parser::is_transfer_instruction(&message, &instruction, None).unwrap());
         assert_rejected(&message, &instruction);
     }
 
@@ -311,7 +355,7 @@ mod tests {
         let mut instruction = valid_transfer_instruction();
         instruction.data.truncate(7);
         assert!(matches!(
-            Parser::is_transfer_instruction(&message, &instruction),
+            Parser::is_transfer_instruction(&message, &instruction, None),
             Err(AggError::InvalidTransferInstruction)
         ));
         assert_rejected(&message, &instruction);
@@ -323,7 +367,7 @@ mod tests {
         let mut instruction = valid_transfer_instruction();
         instruction.data[1] = 1;
         assert_eq!(instruction.data[0], 2);
-        assert!(!Parser::is_transfer_instruction(&message, &instruction).unwrap());
+        assert!(!Parser::is_transfer_instruction(&message, &instruction, None).unwrap());
         assert_rejected(&message, &instruction);
     }
 
@@ -363,7 +407,8 @@ mod tests {
     fn valid_transfer_preserves_existing_decoded_output() {
         let (from, to, message) = transfer_keys();
         let decoded =
-            Parser::decode_transfer_instruction(&message, &valid_transfer_instruction()).unwrap();
+            Parser::decode_transfer_instruction(&message, &valid_transfer_instruction(), None)
+                .unwrap();
         let value = serde_json::to_value(&decoded).unwrap();
         assert_eq!(
             value,
@@ -947,5 +992,304 @@ mod tests {
         assert!(block
             .get_tx_details(&Signature::from([21; 64]).to_string())
             .is_some());
+    }
+
+    struct SignedV0Transfer {
+        lamports: u64,
+        static_keys: Vec<Pubkey>,
+        writable: Vec<Pubkey>,
+        readonly: Vec<Pubkey>,
+        account_indexes: Vec<u8>,
+        program_index: u8,
+        readonly_unsigned: u8,
+        post_balances: Vec<u64>,
+        loaded_addresses: Option<Option<UiLoadedAddresses>>,
+    }
+
+    fn signed_v0_transfer(
+        source: &Keypair,
+        fixture: SignedV0Transfer,
+    ) -> (VersionedTransaction, EncodedTransactionWithStatusMeta) {
+        let address_table_lookups = if fixture.writable.is_empty() && fixture.readonly.is_empty() {
+            Vec::new()
+        } else {
+            vec![MessageAddressTableLookup {
+                account_key: account(99),
+                writable_indexes: (0..fixture.writable.len() as u8).collect(),
+                readonly_indexes: (0..fixture.readonly.len() as u8).collect(),
+            }]
+        };
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: fixture.readonly_unsigned,
+            },
+            account_keys: fixture.static_keys,
+            recent_blockhash: Hash::new_from_array([8; 32]),
+            instructions: vec![CompiledInstruction::new(
+                fixture.program_index,
+                &SystemInstruction::Transfer {
+                    lamports: fixture.lamports,
+                },
+                fixture.account_indexes,
+            )],
+            address_table_lookups,
+        });
+        let versioned =
+            VersionedTransaction::try_new(message, &[source]).expect("sign v0 transfer");
+        let mut meta = balances_meta(fixture.post_balances);
+        meta.loaded_addresses = match fixture.loaded_addresses {
+            None => OptionSerializer::Skip,
+            Some(None) => OptionSerializer::None,
+            Some(Some(addresses)) => OptionSerializer::Some(addresses),
+        };
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(meta),
+            version: Some(TransactionVersion::Number(0)),
+        };
+        (versioned, encoded)
+    }
+
+    fn loaded_destination_transfer(
+        source: &Keypair,
+        destination: Pubkey,
+        lamports: u64,
+        post_balances: Vec<u64>,
+        loaded_addresses: Option<Option<UiLoadedAddresses>>,
+    ) -> (VersionedTransaction, EncodedTransactionWithStatusMeta) {
+        signed_v0_transfer(
+            source,
+            SignedV0Transfer {
+                lamports,
+                static_keys: vec![source.pubkey(), system_program::id()],
+                writable: vec![destination],
+                readonly: vec![],
+                account_indexes: vec![0, 2],
+                program_index: 1,
+                readonly_unsigned: 1,
+                post_balances,
+                loaded_addresses,
+            },
+        )
+    }
+
+    fn transfer_json(block: &Block, signature: &str) -> serde_json::Value {
+        let record = block
+            .get_tx_details(signature)
+            .expect("indexed transaction");
+        serde_json::to_value(record).expect("transaction json")
+    }
+
+    #[test]
+    fn legacy_transfer_resolves_static_accounts() {
+        let source = Keypair::new();
+        let destination = account(12);
+        let lamports = 1_500_000_000;
+        let instruction = system_instruction::transfer(&source.pubkey(), &destination, lamports);
+        let message = Message::new(&[instruction], Some(&source.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&source], Hash::new_from_array([7; 32]))
+            .expect("sign legacy transfer");
+        let versioned = VersionedTransaction::from(transaction);
+        let static_keys = versioned.message.static_account_keys().to_vec();
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(balances_meta(vec![9, 8, 1])),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        let signature = versioned.signatures[0].to_string();
+        let block = parse_accounts(encoded);
+        let value = transfer_json(&block, &signature);
+        assert_eq!(
+            value["instruction"][0],
+            serde_json::to_value(Instruction::transfer(
+                static_keys[0],
+                static_keys[1],
+                lamports as f64 / 1_000_000_000.0
+            ))
+            .unwrap()
+        );
+        assert_eq!(block.get_account_map().unwrap().len(), static_keys.len());
+    }
+
+    #[test]
+    fn v0_transfer_resolves_static_accounts() {
+        let source = Keypair::new();
+        let destination = account(12);
+        let lamports = 2_000_000_000;
+        let (versioned, encoded) = signed_v0_transfer(
+            &source,
+            SignedV0Transfer {
+                lamports,
+                static_keys: vec![source.pubkey(), destination, system_program::id()],
+                writable: vec![],
+                readonly: vec![],
+                account_indexes: vec![0, 1],
+                program_index: 2,
+                readonly_unsigned: 1,
+                post_balances: vec![40, 50, 1],
+                loaded_addresses: None,
+            },
+        );
+        let block = parse_accounts(encoded);
+        let value = transfer_json(&block, &versioned.signatures[0].to_string());
+        assert_eq!(
+            value["instruction"][0],
+            serde_json::to_value(Instruction::transfer(
+                source.pubkey(),
+                destination,
+                lamports as f64 / 1_000_000_000.0
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            block.get_account_balance(&destination.to_string()),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn v0_transfer_resolves_loaded_writable_destination() {
+        let source = Keypair::new();
+        let destination = account(21);
+        let lamports = 3_500_000_000;
+        let balances = vec![70, 1, u64::MAX];
+        let (versioned, encoded) = loaded_destination_transfer(
+            &source,
+            destination,
+            lamports,
+            balances.clone(),
+            Some(Some(loaded(&[destination], &[]))),
+        );
+        assert_eq!(versioned.message.static_account_keys().len(), 2);
+        let block = parse_accounts(encoded);
+        let signature = versioned.signatures[0].to_string();
+        let value = transfer_json(&block, &signature);
+        assert_eq!(
+            value["instruction"][0],
+            serde_json::to_value(Instruction::transfer(
+                source.pubkey(),
+                destination,
+                lamports as f64 / 1_000_000_000.0
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            block.get_account_balance(&source.pubkey().to_string()),
+            Some(balances[0])
+        );
+        assert_eq!(
+            block.get_account_balance(&system_program::id().to_string()),
+            Some(balances[1])
+        );
+        assert_eq!(
+            block.get_account_balance(&destination.to_string()),
+            Some(balances[2])
+        );
+        assert!(block.get_tx_details(&signature).is_some());
+    }
+
+    #[test]
+    fn missing_loaded_addresses_reject_a_loaded_transfer_operand() {
+        let source = Keypair::new();
+        let destination = account(21);
+        let (_versioned, encoded) =
+            loaded_destination_transfer(&source, destination, 10, vec![1, 1, 1], None);
+        assert!(matches!(
+            encoded.meta.as_ref().unwrap().loaded_addresses,
+            OptionSerializer::Skip
+        ));
+        assert_balance_error(encoded);
+
+        let source = Keypair::new();
+        let destination = account(21);
+        let (_versioned, explicit_none) =
+            loaded_destination_transfer(&source, destination, 10, vec![1, 1, 1], Some(None));
+        assert_balance_error(explicit_none);
+    }
+
+    #[test]
+    fn loaded_address_count_mismatch_rejects_a_transfer() {
+        let destination = account(21);
+        let source = Keypair::new();
+        let (_versioned, encoded) = loaded_destination_transfer(
+            &source,
+            destination,
+            10,
+            vec![1, 1, 1],
+            Some(Some(loaded(&[destination, account(22)], &[]))),
+        );
+        assert_balance_error(encoded);
+    }
+
+    #[test]
+    fn malformed_loaded_address_rejects_a_transfer() {
+        let destination = account(21);
+        let source = Keypair::new();
+        let mut addresses = loaded(&[destination], &[]);
+        addresses.writable = vec!["not-a-solana-public-key".to_string()];
+        let (_versioned, encoded) = loaded_destination_transfer(
+            &source,
+            destination,
+            10,
+            vec![1, 1, 1],
+            Some(Some(addresses)),
+        );
+        assert_balance_error(encoded);
+    }
+
+    fn resolved_transfer_message() -> (VersionedMessage, UiTransactionStatusMeta) {
+        let source = Keypair::new();
+        let destination = account(21);
+        let (versioned, encoded) = loaded_destination_transfer(
+            &source,
+            destination,
+            10,
+            vec![1, 1, 1],
+            Some(Some(loaded(&[destination], &[]))),
+        );
+        (versioned.message, encoded.meta.expect("loaded metadata"))
+    }
+
+    #[test]
+    fn invalid_transfer_source_index_is_rejected() {
+        let (message, meta) = resolved_transfer_message();
+        let mut instruction = message.instructions()[0].clone();
+        instruction.accounts = vec![9, 2];
+        assert!(matches!(
+            Parser::decode_transfer_instruction(&message, &instruction, Some(&meta)),
+            Err(AggError::InvalidTransferInstruction)
+        ));
+    }
+
+    #[test]
+    fn invalid_transfer_destination_index_is_rejected() {
+        let (message, meta) = resolved_transfer_message();
+        let mut instruction = message.instructions()[0].clone();
+        instruction.accounts = vec![0, 9];
+        assert!(matches!(
+            Parser::decode_transfer_instruction(&message, &instruction, Some(&meta)),
+            Err(AggError::InvalidTransferInstruction)
+        ));
+    }
+
+    #[test]
+    fn invalid_transfer_program_index_is_rejected() {
+        let (message, meta) = resolved_transfer_message();
+        let mut instruction = message.instructions()[0].clone();
+        instruction.program_id_index = 9;
+        assert!(matches!(
+            Parser::decode_transfer_instruction(&message, &instruction, Some(&meta)),
+            Err(AggError::InvalidTransferInstruction)
+        ));
     }
 }
