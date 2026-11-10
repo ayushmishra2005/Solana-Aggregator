@@ -5,11 +5,20 @@ use log::{error, warn};
 use solana_client::client_error::{ClientError, ClientErrorKind};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
-use solana_client::rpc_custom_error::JSON_RPC_SERVER_ERROR_SLOT_SKIPPED;
+use solana_client::rpc_custom_error::{
+    JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+    JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET, JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
+};
 use solana_client::rpc_request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_transaction_status::{UiConfirmedBlock, UiTransactionEncoding};
+use std::future::Future;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+
+const MAX_GET_BLOCK_ATTEMPTS: u32 = 3;
+const INITIAL_GET_BLOCK_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_GET_BLOCK_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 enum BlockFetch {
@@ -111,30 +120,125 @@ impl BlockFetcher {
             ProtocolMessage::FetchBlock(chain_url, rpc_block_config, latest_slot, sender) => {
                 let client =
                     RpcClient::new_with_timeout(chain_url, std::time::Duration::from_secs(30));
-                let _outcome = Self::request_block(&client, latest_slot, rpc_block_config, sender);
+                let _outcome =
+                    Self::request_block(&client, latest_slot, rpc_block_config, sender).await;
             }
             _ => {}
         }
     }
 
-    fn request_block(
+    async fn request_block(
         client: &RpcClient,
         slot: u64,
         rpc_block_config: RpcBlockConfig,
         sender: UnboundedSender<ProtocolMessage>,
     ) -> BlockFetch {
-        let outcome =
-            Self::classify_get_block(slot, client.get_block_with_config(slot, rpc_block_config));
-        Self::dispatch_block_fetch(&outcome, &sender);
-        outcome
+        Self::request_block_retrying(client, slot, rpc_block_config, sender, Self::pause).await
     }
 
-    fn classify_get_block(slot: u64, result: Result<UiConfirmedBlock, ClientError>) -> BlockFetch {
-        match result {
-            Ok(block) => BlockFetch::Fetched(block),
-            Err(err) if Self::is_explicit_slot_skip(&err) => BlockFetch::Skipped(slot),
-            Err(err) => BlockFetch::Failed(AggError::from(err)),
+    async fn request_block_retrying<P, F>(
+        client: &RpcClient,
+        slot: u64,
+        rpc_block_config: RpcBlockConfig,
+        sender: UnboundedSender<ProtocolMessage>,
+        mut pause: P,
+    ) -> BlockFetch
+    where
+        P: FnMut(Duration) -> F,
+        F: Future<Output = ()>,
+    {
+        for attempt in 1..=MAX_GET_BLOCK_ATTEMPTS {
+            match client.get_block_with_config(slot, rpc_block_config) {
+                Ok(block) => {
+                    let outcome = BlockFetch::Fetched(block);
+                    Self::dispatch_block_fetch(&outcome, &sender);
+                    return outcome;
+                }
+                Err(err) if Self::is_explicit_slot_skip(&err) => {
+                    let outcome = BlockFetch::Skipped(slot);
+                    Self::dispatch_block_fetch(&outcome, &sender);
+                    return outcome;
+                }
+                Err(err)
+                    if attempt < MAX_GET_BLOCK_ATTEMPTS && Self::is_retryable_block_fetch(&err) =>
+                {
+                    let delay = Self::backoff_before_next_attempt(attempt);
+                    let sanitized = AggError::from(err);
+                    warn!(
+                        target: "subscriber",
+                        "Retrying getBlock for slot {slot} after attempt {attempt} of {MAX_GET_BLOCK_ATTEMPTS} in {delay:?}: {sanitized:?}"
+                    );
+                    pause(delay).await;
+                }
+                Err(err) => {
+                    let outcome = BlockFetch::Failed(AggError::from(err));
+                    Self::dispatch_block_fetch(&outcome, &sender);
+                    return outcome;
+                }
+            }
         }
+        unreachable!("getBlock retry loop returns on every attempt");
+    }
+
+    async fn pause(delay: Duration) {
+        tokio::time::sleep(delay).await;
+    }
+
+    /// Delay before the next attempt after `failed_attempt` (1-based).
+    /// Attempt 1 waits 200ms, attempt 2 waits 400ms, later waits cap at 1s.
+    fn backoff_before_next_attempt(failed_attempt: u32) -> Duration {
+        let shift = failed_attempt.saturating_sub(1).min(16);
+        let multiplier = 1u64 << shift;
+        let millis = INITIAL_GET_BLOCK_BACKOFF.as_millis() as u64;
+        Duration::from_millis(
+            millis
+                .saturating_mul(multiplier)
+                .min(MAX_GET_BLOCK_BACKOFF.as_millis() as u64),
+        )
+    }
+
+    fn is_retryable_block_fetch(err: &ClientError) -> bool {
+        match err.kind() {
+            ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+                *code == JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE
+                    || *code == JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET
+            }
+            ClientErrorKind::Reqwest(err) => Self::reqwest_is_transient(err),
+            ClientErrorKind::Io(err) => Self::io_is_transient(err),
+            _ => false,
+        }
+    }
+
+    fn reqwest_is_transient(err: &solana_client::client_error::reqwest::Error) -> bool {
+        err.is_timeout()
+            || err.is_connect()
+            || err.status()
+                == Some(solana_client::client_error::reqwest::StatusCode::TOO_MANY_REQUESTS)
+            || Self::error_source_is_transient_io(std::error::Error::source(err))
+    }
+
+    fn error_source_is_transient_io(source: Option<&(dyn std::error::Error + 'static)>) -> bool {
+        let mut source = source;
+        while let Some(err) = source {
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                return Self::io_is_transient(io);
+            }
+            source = err.source();
+        }
+        false
+    }
+
+    fn io_is_transient(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::UnexpectedEof
+        )
     }
 
     /// Solana JSON-RPC code -32007 (`SlotSkipped`) is the only explicit skip.
@@ -246,7 +350,7 @@ mod tests {
             max_supported_transaction_version: Some(0),
         };
 
-        BlockFetcher::request_block(&client, slot, config, sender);
+        block_on(BlockFetcher::request_block(&client, slot, config, sender));
 
         let calls = calls.lock().expect("rpc recorder");
         assert_eq!(calls.len(), 1, "slot {slot} should issue one RPC request");
@@ -364,8 +468,19 @@ mod tests {
 
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let logged = capture_fetch_logs(|| {
-            BlockFetcher::request_block(&client, 100, config, sender);
+            log::set_max_level(log::LevelFilter::Warn);
+            block_on(async {
+                BlockFetcher::request_block_retrying(&client, 100, config, sender, |_delay| {
+                    futures_util::future::ready(())
+                })
+                .await;
+            });
+            log::set_max_level(log::LevelFilter::Error);
         });
+        assert!(
+            logged.contains("Retrying getBlock"),
+            "retry was not logged: {logged}"
+        );
         assert!(
             logged.contains("Failed to fetch block"),
             "fetch error was not logged: {logged}"
@@ -394,13 +509,14 @@ mod tests {
         EncodableWithMeta, EncodedTransactionWithStatusMeta, TransactionStatusMeta,
         UiConfirmedBlock,
     };
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::time::Duration;
 
     type RecordedCalls = Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>;
 
     struct ScriptedSender {
-        response: Mutex<Option<RpcResult<serde_json::Value>>>,
+        responses: Mutex<VecDeque<RpcResult<serde_json::Value>>>,
         calls: RecordedCalls,
     }
 
@@ -419,10 +535,10 @@ mod tests {
                 .expect("rpc recorder")
                 .push((request, params));
             let response = self
-                .response
+                .responses
                 .lock()
                 .expect("rpc response")
-                .take()
+                .pop_front()
                 .expect("scripted response");
             Box::pin(async move { response })
         }
@@ -446,16 +562,56 @@ mod tests {
         }
     }
 
-    fn scripted_client(response: RpcResult<serde_json::Value>) -> (RpcClient, RecordedCalls) {
+    fn scripted_client(responses: Vec<RpcResult<serde_json::Value>>) -> (RpcClient, RecordedCalls) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let client = RpcClient::new_sender(
             ScriptedSender {
-                response: Mutex::new(Some(response)),
+                responses: Mutex::new(VecDeque::from(responses)),
                 calls: Arc::clone(&calls),
             },
             RpcClientConfig::with_commitment(CommitmentConfig::finalized()),
         );
         (client, calls)
+    }
+
+    struct FetchTrial {
+        outcome: BlockFetch,
+        calls: Vec<(RpcRequest, serde_json::Value)>,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+        delays: Vec<Duration>,
+    }
+
+    async fn fetch_responses(
+        slot: u64,
+        responses: Vec<RpcResult<serde_json::Value>>,
+    ) -> FetchTrial {
+        let (client, calls) = scripted_client(responses);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let delay_log = Arc::clone(&delays);
+        let outcome = BlockFetcher::request_block_retrying(
+            &client,
+            slot,
+            block_config(),
+            sender,
+            move |delay| {
+                delay_log.lock().expect("backoff log").push(delay);
+                futures_util::future::ready(())
+            },
+        )
+        .await;
+        let calls = calls.lock().expect("rpc recorder").clone();
+        let delays = delays.lock().expect("backoff log").clone();
+        FetchTrial {
+            outcome,
+            calls,
+            receiver,
+            delays,
+        }
+    }
+
+    async fn fetch_scripted(slot: u64, response: RpcResult<serde_json::Value>) -> FetchTrial {
+        fetch_responses(slot, vec![response]).await
     }
 
     fn rpc_failure(code: i64, message: String) -> ClientError {
@@ -467,33 +623,28 @@ mod tests {
         .into()
     }
 
-    fn fetch_scripted(
+    fn assert_finalized_attempts(
+        calls: &[(RpcRequest, serde_json::Value)],
         slot: u64,
-        response: RpcResult<serde_json::Value>,
-    ) -> (
-        BlockFetch,
-        Vec<(RpcRequest, serde_json::Value)>,
-        tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+        attempts: usize,
     ) {
-        let (client, calls) = scripted_client(response);
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = BlockFetcher::request_block(&client, slot, block_config(), sender);
-        let calls = calls.lock().expect("rpc recorder").clone();
-        (outcome, calls, receiver)
+        assert_eq!(calls.len(), attempts);
+        for call in calls {
+            assert_eq!(call.0, RpcRequest::GetBlock);
+            let params = call.1.as_array().expect("getBlock params");
+            assert_eq!(params[0].as_u64(), Some(slot));
+            assert_eq!(
+                params
+                    .get(1)
+                    .and_then(|config| config.get("commitment"))
+                    .and_then(serde_json::Value::as_str),
+                Some("finalized")
+            );
+        }
     }
 
     fn assert_finalized_get_block(calls: &[(RpcRequest, serde_json::Value)], slot: u64) {
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, RpcRequest::GetBlock);
-        let params = calls[0].1.as_array().expect("getBlock params");
-        assert_eq!(params[0].as_u64(), Some(slot));
-        assert_eq!(
-            params
-                .get(1)
-                .and_then(|config| config.get("commitment"))
-                .and_then(serde_json::Value::as_str),
-            Some("finalized")
-        );
+        assert_finalized_attempts(calls, slot, 1);
     }
 
     fn sample_transaction() -> (EncodedTransactionWithStatusMeta, String, String) {
@@ -560,15 +711,15 @@ mod tests {
     fn finalized_get_block_is_fetched_and_processed() {
         let (transaction, signature, account) = sample_transaction();
         let parsed = block_on(async {
-            let (outcome, calls, mut receiver) =
-                fetch_scripted(100, Ok(confirmed_block(transaction)));
+            let mut trial = fetch_scripted(100, Ok(confirmed_block(transaction))).await;
             assert!(
-                matches!(outcome, BlockFetch::Fetched(block) if block.block_height == Some(42))
+                matches!(trial.outcome, BlockFetch::Fetched(block) if block.block_height == Some(42))
             );
-            assert_finalized_get_block(&calls, 100);
+            assert!(trial.delays.is_empty());
+            assert_finalized_get_block(&trial.calls, 100);
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
-                if let Ok(message) = receiver.try_recv() {
+                if let Ok(message) = trial.receiver.try_recv() {
                     return message;
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -592,7 +743,7 @@ mod tests {
     #[test]
     fn explicit_slot_skipped_is_not_a_fetched_block() {
         let slot = 500;
-        let (outcome, calls, mut receiver) = fetch_scripted(
+        let mut trial = block_on(fetch_scripted(
             slot,
             Err(rpc_failure(
                 JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
@@ -600,18 +751,24 @@ mod tests {
                     "Slot {slot} was skipped, or missing due to ledger jump to recent snapshot"
                 ),
             )),
-        );
-        assert!(matches!(outcome, BlockFetch::Skipped(skipped) if skipped == slot));
-        assert_finalized_get_block(&calls, slot);
-        assert!(receiver.try_recv().is_err());
+        ));
+        assert!(matches!(trial.outcome, BlockFetch::Skipped(skipped) if skipped == slot));
+        assert!(trial.delays.is_empty());
+        assert_finalized_get_block(&trial.calls, slot);
+        assert!(trial.receiver.try_recv().is_err());
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (client, _) = scripted_client(Err(rpc_failure(
+        let (client, _) = scripted_client(vec![Err(rpc_failure(
             JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
             format!("Slot {slot} was skipped, or missing due to ledger jump to recent snapshot"),
-        )));
+        ))]);
         let logged = capture_fetch_logs(|| {
             log::set_max_level(log::LevelFilter::Warn);
-            BlockFetcher::request_block(&client, slot, block_config(), sender);
+            block_on(BlockFetcher::request_block(
+                &client,
+                slot,
+                block_config(),
+                sender,
+            ));
             log::set_max_level(log::LevelFilter::Error);
         });
         let skipped_line = logged
@@ -623,54 +780,69 @@ mod tests {
 
     #[test]
     fn unavailable_block_is_a_failure() {
-        for (code, message) in [
-            (
-                JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
-                "Block not available for slot 100",
-            ),
-            (
-                JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET,
-                "Block status not yet available for slot 100",
-            ),
-            (
-                JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
-                "Slot 100 was skipped, or missing in long-term storage",
-            ),
+        for code in [
+            JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+            JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET,
         ] {
-            let (outcome, calls, mut receiver) =
-                fetch_scripted(100, Err(rpc_failure(code, message.to_string())));
-            assert!(
-                matches!(outcome, BlockFetch::Failed(_)),
-                "code {code} was classified as {outcome:?}"
+            let mut responses = Vec::new();
+            for _ in 0..3 {
+                responses.push(Err(rpc_failure(code, format!("transient {code}"))));
+            }
+            let mut trial = block_on(fetch_responses(100, responses));
+            assert!(matches!(trial.outcome, BlockFetch::Failed(_)));
+            assert_finalized_attempts(&trial.calls, 100, 3);
+            assert_eq!(
+                trial.delays,
+                vec![Duration::from_millis(200), Duration::from_millis(400)]
             );
-            assert_finalized_get_block(&calls, 100);
-            assert!(receiver.try_recv().is_err());
+            assert!(trial.receiver.try_recv().is_err());
         }
+
+        let mut trial = block_on(fetch_scripted(
+            100,
+            Err(rpc_failure(
+                JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
+                "Slot 100 was skipped, or missing in long-term storage".to_string(),
+            )),
+        ));
+        assert!(matches!(trial.outcome, BlockFetch::Failed(_)));
+        assert!(trial.delays.is_empty());
+        assert_finalized_get_block(&trial.calls, 100);
+        assert!(trial.receiver.try_recv().is_err());
     }
 
     #[test]
     fn unknown_rpc_failure_is_not_a_skipped_slot() {
-        let (outcome, _calls, mut receiver) =
-            fetch_scripted(100, Err(rpc_failure(-32603, "Internal error".to_string())));
-        assert!(matches!(outcome, BlockFetch::Failed(_)));
-        assert!(receiver.try_recv().is_err());
+        let mut trial = block_on(fetch_scripted(
+            100,
+            Err(rpc_failure(-32602, "Invalid params".to_string())),
+        ));
+        assert!(matches!(trial.outcome, BlockFetch::Failed(_)));
+        assert!(trial.delays.is_empty());
+        assert_finalized_get_block(&trial.calls, 100);
+        assert!(trial.receiver.try_recv().is_err());
     }
 
     fn local_http(status_line: &'static str, hang: bool) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local http");
         let addr = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
-            for _ in 0..8 {
+            for _ in 0..24 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
+                if hang {
+                    std::thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        std::thread::sleep(Duration::from_secs(2));
+                    });
+                    continue;
+                }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
-                if hang {
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
                 let response = format!(
                     "HTTP/1.1 {status_line}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 );
@@ -702,12 +874,15 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut outcome = None;
         let logged = capture_fetch_logs(|| {
-            outcome = Some(BlockFetcher::request_block(
+            log::set_max_level(log::LevelFilter::Warn);
+            outcome = Some(block_on(BlockFetcher::request_block_retrying(
                 &client,
                 100,
                 block_config(),
                 sender,
-            ));
+                |_delay| futures_util::future::ready(()),
+            )));
+            log::set_max_level(log::LevelFilter::Error);
         });
         let outcome = outcome.expect("rate-limited fetch");
         assert_failed_without_block_or_secret(outcome, &logged);
@@ -722,12 +897,13 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut outcome = None;
         let logged = capture_fetch_logs(|| {
-            outcome = Some(BlockFetcher::request_block(
+            outcome = Some(block_on(BlockFetcher::request_block_retrying(
                 &client,
                 100,
                 block_config(),
                 sender,
-            ));
+                |_delay| futures_util::future::ready(()),
+            )));
         });
         let outcome = outcome.expect("timed out fetch");
         assert_failed_without_block_or_secret(outcome, &logged);
@@ -745,16 +921,211 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut outcome = None;
         let logged = capture_fetch_logs(|| {
-            outcome = Some(BlockFetcher::request_block(
+            log::set_max_level(log::LevelFilter::Warn);
+            outcome = Some(block_on(BlockFetcher::request_block_retrying(
                 &client,
                 100,
                 block_config(),
                 sender,
-            ));
+                |_delay| futures_util::future::ready(()),
+            )));
+            log::set_max_level(log::LevelFilter::Error);
         });
         let outcome = outcome.expect("transport failure");
+        assert!(
+            logged.contains("Retrying getBlock"),
+            "transport failure was not retried: {logged}"
+        );
         assert_failed_without_block_or_secret(outcome, &logged);
         assert!(logged.contains("127.0.0.1"), "{logged}");
         assert!(receiver.try_recv().is_err());
+    }
+
+    fn live_get_block_error(url: String, timeout: Duration) -> ClientError {
+        let client = RpcClient::new_with_timeout(url, timeout);
+        client
+            .get_block_with_config(100, block_config())
+            .expect_err("live getBlock failure")
+    }
+
+    async fn wait_for_one_parsed(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ProtocolMessage>,
+    ) -> ProtocolMessage {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let message = loop {
+            if let Ok(message) = receiver.try_recv() {
+                break message;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("fetched block did not enter the parser pipeline");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            receiver.try_recv().is_err(),
+            "block was processed more than once"
+        );
+        message
+    }
+
+    #[test]
+    fn get_block_backoff_is_capped_at_one_second() {
+        assert_eq!(
+            BlockFetcher::backoff_before_next_attempt(1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            BlockFetcher::backoff_before_next_attempt(2),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            BlockFetcher::backoff_before_next_attempt(3),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            BlockFetcher::backoff_before_next_attempt(4),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            BlockFetcher::backoff_before_next_attempt(10),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn retryable_get_block_failures_then_succeed_once() {
+        let (transaction, signature, account) = sample_transaction();
+        let parsed = block_on(async {
+            let mut trial = fetch_responses(
+                77,
+                vec![
+                    Err(rpc_failure(
+                        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+                        "Block not available for slot 77".to_string(),
+                    )),
+                    Err(rpc_failure(
+                        JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET,
+                        "Block status not yet available for slot 77".to_string(),
+                    )),
+                    Ok(confirmed_block(transaction)),
+                ],
+            )
+            .await;
+            assert!(matches!(trial.outcome, BlockFetch::Fetched(_)));
+            assert_finalized_attempts(&trial.calls, 77, 3);
+            assert_eq!(
+                trial.delays,
+                vec![Duration::from_millis(200), Duration::from_millis(400)]
+            );
+            wait_for_one_parsed(&mut trial.receiver).await
+        });
+        match parsed {
+            ProtocolMessage::ParsedBlock(block_no, total_chunks, chunk_no, block) => {
+                assert_eq!(block_no, 42);
+                assert_eq!(total_chunks, 1);
+                assert_eq!(chunk_no, 0);
+                assert!(block.get_tx_details(&signature).is_some());
+                assert_eq!(block.get_account_balance(&account), Some(10));
+            }
+            other => panic!("expected one parsed block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skipped_slot_after_a_transient_failure_stops_retrying() {
+        let slot = 77;
+        let mut trial = block_on(fetch_responses(
+            slot,
+            vec![
+                Err(rpc_failure(
+                    JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+                    format!("Block not available for slot {slot}"),
+                )),
+                Err(rpc_failure(
+                    JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
+                    format!(
+                        "Slot {slot} was skipped, or missing due to ledger jump to recent snapshot"
+                    ),
+                )),
+            ],
+        ));
+        assert!(matches!(trial.outcome, BlockFetch::Skipped(skipped) if skipped == slot));
+        assert_finalized_attempts(&trial.calls, slot, 2);
+        assert_eq!(trial.delays, vec![Duration::from_millis(200)]);
+        assert!(trial.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn rate_limit_timeout_and_transport_errors_are_retried() {
+        let rate_limit = live_get_block_error(
+            local_http("429 Too Many Requests", false),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(
+            rate_limit.kind(),
+            solana_client::client_error::ClientErrorKind::Reqwest(err)
+                if err.status()
+                    == Some(solana_client::client_error::reqwest::StatusCode::TOO_MANY_REQUESTS)
+        ));
+        assert!(BlockFetcher::is_retryable_block_fetch(&rate_limit));
+
+        let timeout = live_get_block_error(local_http("200 OK", true), Duration::from_millis(200));
+        assert!(matches!(
+            timeout.kind(),
+            solana_client::client_error::ClientErrorKind::Reqwest(err) if err.is_timeout()
+        ));
+        assert!(BlockFetcher::is_retryable_block_fetch(&timeout));
+
+        let transport = live_get_block_error(
+            format!("http://127.0.0.1:1/?api-key={RPC_SECRET}"),
+            Duration::from_secs(2),
+        );
+        assert!(BlockFetcher::is_retryable_block_fetch(&transport));
+
+        block_on(async {
+            let (transaction, _, _) = sample_transaction();
+            let mut rate_trial =
+                fetch_responses(100, vec![Err(rate_limit), Ok(confirmed_block(transaction))]).await;
+            assert!(matches!(rate_trial.outcome, BlockFetch::Fetched(_)));
+            assert_finalized_attempts(&rate_trial.calls, 100, 2);
+            assert_eq!(rate_trial.delays, vec![Duration::from_millis(200)]);
+            assert!(matches!(
+                wait_for_one_parsed(&mut rate_trial.receiver).await,
+                ProtocolMessage::ParsedBlock(_, 1, 0, _)
+            ));
+
+            let (transaction, _, _) = sample_transaction();
+            let mut timeout_trial =
+                fetch_responses(100, vec![Err(timeout), Ok(confirmed_block(transaction))]).await;
+            assert!(matches!(timeout_trial.outcome, BlockFetch::Fetched(_)));
+            assert_eq!(timeout_trial.delays, vec![Duration::from_millis(200)]);
+            assert!(matches!(
+                wait_for_one_parsed(&mut timeout_trial.receiver).await,
+                ProtocolMessage::ParsedBlock(_, 1, 0, _)
+            ));
+        });
+
+        let transports = vec![
+            transport,
+            live_get_block_error(
+                format!("http://127.0.0.1:1/?api-key={RPC_SECRET}"),
+                Duration::from_secs(2),
+            ),
+            live_get_block_error(
+                format!("http://127.0.0.1:1/?api-key={RPC_SECRET}"),
+                Duration::from_secs(2),
+            ),
+        ];
+        let mut exhausted = block_on(fetch_responses(
+            100,
+            transports.into_iter().map(Err).collect(),
+        ));
+        assert!(matches!(exhausted.outcome, BlockFetch::Failed(_)));
+        assert_finalized_attempts(&exhausted.calls, 100, 3);
+        assert_eq!(
+            exhausted.delays,
+            vec![Duration::from_millis(200), Duration::from_millis(400)]
+        );
+        assert!(exhausted.receiver.try_recv().is_err());
     }
 }
