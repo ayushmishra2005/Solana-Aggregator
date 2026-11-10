@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_config::RpcBlockConfig;
-use solana_program::hash::Hash;
 use solana_program::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 use solana_transaction_status::{EncodedTransactionWithStatusMeta, UiTransactionStatusMeta};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -108,8 +108,8 @@ impl Block {
         self.tx_map.get(tx_hash)
     }
 
-    pub fn push_transaction(&mut self, tx_hash: Hash, tx: TxRecord) {
-        self.tx_map.insert(tx_hash.to_string(), tx);
+    pub fn push_transaction(&mut self, signature: Signature, tx: TxRecord) {
+        self.tx_map.insert(signature.to_string(), tx);
     }
 
     pub fn get_tx_hash(&self) -> Vec<String> {
@@ -202,17 +202,17 @@ pub struct QueryParams {
 #[cfg(test)]
 mod tests {
     use super::{Block, UnprocessedBlock};
-    use solana_program::hash::Hash;
+    use solana_sdk::signature::Signature;
 
-    fn tx_hash(chunk_no: u64) -> Hash {
-        let mut bytes = [0u8; 32];
+    fn tx_signature(chunk_no: u64) -> Signature {
+        let mut bytes = [0u8; 64];
         bytes[..8].copy_from_slice(&chunk_no.to_le_bytes());
-        Hash::new_from_array(bytes)
+        Signature::from(bytes)
     }
 
     fn partial(chunk_no: u64, balance: u64) -> Block {
         let mut block = Block::default();
-        block.push_transaction(tx_hash(chunk_no), super::TxRecord::default());
+        block.push_transaction(tx_signature(chunk_no), super::TxRecord::default());
         block.insert_account(format!("chunk-{chunk_no}"), balance);
         block.insert_account("merged".to_string(), balance);
         block
@@ -239,8 +239,12 @@ mod tests {
         let (block, completed) = insert_sequence(2, &[(0, 1), (1, 2)]);
         assert_eq!(completed, vec![false, true]);
         let merged = block.complete_the_block();
-        assert!(merged.get_tx_details(&tx_hash(0).to_string()).is_some());
-        assert!(merged.get_tx_details(&tx_hash(1).to_string()).is_some());
+        assert!(merged
+            .get_tx_details(&tx_signature(0).to_string())
+            .is_some());
+        assert!(merged
+            .get_tx_details(&tx_signature(1).to_string())
+            .is_some());
         assert_eq!(merged.get_account_balance("merged"), Some(2));
     }
 
@@ -249,8 +253,12 @@ mod tests {
         let (block, completed) = insert_sequence(2, &[(1, 2), (0, 1)]);
         assert_eq!(completed, vec![false, true]);
         let merged = block.complete_the_block();
-        assert!(merged.get_tx_details(&tx_hash(0).to_string()).is_some());
-        assert!(merged.get_tx_details(&tx_hash(1).to_string()).is_some());
+        assert!(merged
+            .get_tx_details(&tx_signature(0).to_string())
+            .is_some());
+        assert!(merged
+            .get_tx_details(&tx_signature(1).to_string())
+            .is_some());
         assert_eq!(merged.get_account_balance("chunk-0"), Some(1));
         assert_eq!(merged.get_account_balance("chunk-1"), Some(2));
         assert_eq!(merged.get_account_balance("merged"), Some(2));
@@ -261,8 +269,12 @@ mod tests {
         let (block, completed) = insert_sequence(2, &[(0, 1), (0, 1), (1, 2)]);
         assert_eq!(completed, vec![false, false, true]);
         let merged = block.complete_the_block();
-        assert!(merged.get_tx_details(&tx_hash(0).to_string()).is_some());
-        assert!(merged.get_tx_details(&tx_hash(1).to_string()).is_some());
+        assert!(merged
+            .get_tx_details(&tx_signature(0).to_string())
+            .is_some());
+        assert!(merged
+            .get_tx_details(&tx_signature(1).to_string())
+            .is_some());
     }
 
     #[test]

@@ -406,3 +406,218 @@ impl RocksDb {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RocksDb;
+    use crate::error::AggError;
+    use crate::parser::Parser;
+    use crate::util::ProtocolMessage;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::message::Message;
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::signature::{Keypair, Signer};
+    use solana_sdk::system_instruction;
+    use solana_sdk::transaction::{Transaction, TransactionVersion, VersionedTransaction};
+    use solana_transaction_status::{
+        EncodableWithMeta, EncodedTransaction, EncodedTransactionWithStatusMeta,
+        TransactionStatusMeta, UiTransactionEncoding, UiTransactionStatusMeta,
+    };
+    use std::path::PathBuf;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "solana-agg-signature-index-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp database directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
+    }
+
+    fn status_meta(fee: u64, post_balances: Vec<u64>) -> UiTransactionStatusMeta {
+        serde_json::from_value(serde_json::json!({
+            "err": null,
+            "status": {"Ok": null},
+            "fee": fee,
+            "preBalances": post_balances,
+            "postBalances": post_balances,
+        }))
+        .expect("transaction metadata")
+    }
+
+    fn signed_transfer(
+        lamports: u64,
+        fee: u64,
+    ) -> (VersionedTransaction, EncodedTransactionWithStatusMeta) {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let instruction = system_instruction::transfer(&payer.pubkey(), &recipient, lamports);
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction
+            .try_sign(&[&payer], Hash::new_from_array([7; 32]))
+            .expect("sign transfer");
+        let versioned = VersionedTransaction::from(transaction);
+        let meta = status_meta(fee, vec![1_000_000, lamports, 1]);
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(meta),
+            version: Some(TransactionVersion::LEGACY),
+        };
+        (versioned, encoded)
+    }
+
+    fn parse_chunk(transactions: Vec<EncodedTransactionWithStatusMeta>) -> crate::util::Block {
+        let (sender, mut receiver) = unbounded_channel();
+        block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            42,
+            0,
+            1,
+            transactions,
+            sender,
+        )))
+        .expect("parse signed transactions");
+        match receiver.try_recv().expect("parsed block") {
+            ProtocolMessage::ParsedBlock(_, _, _, block) => block,
+            other => panic!("expected a parsed block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transactions_are_indexed_and_loaded_by_signature() {
+        let (first, first_encoded) = signed_transfer(1_500, 5_000);
+        let (second, second_encoded) = signed_transfer(2_500, 6_000);
+        let first_signature = first.signatures[0].to_string();
+        let second_signature = second.signatures[0].to_string();
+        let first_message_hash = first.message.hash().to_string();
+        let second_message_hash = second.message.hash().to_string();
+        assert_ne!(first_signature, first_message_hash);
+        assert_ne!(second_signature, second_message_hash);
+        assert_ne!(first_signature, second_signature);
+
+        let block = parse_chunk(vec![first_encoded, second_encoded]);
+        assert!(block.get_tx_details(&first_message_hash).is_none());
+        assert!(block.get_tx_details(&second_message_hash).is_none());
+        let first_record = block
+            .get_tx_details(&first_signature)
+            .expect("first signature index")
+            .clone();
+        let second_record = block
+            .get_tx_details(&second_signature)
+            .expect("second signature index")
+            .clone();
+
+        let directory = TempDir::new();
+        let (_db_sender, db_receiver) = unbounded_channel();
+        let mut database =
+            RocksDb::initialize(directory.path.to_string_lossy().to_string(), db_receiver)
+                .expect("open temporary database");
+        database.handle_block(42, block).expect("persist block");
+
+        let (reply_sender, mut reply_receiver) = unbounded_channel();
+        database
+            .handle_tx_request(first_signature, reply_sender.clone())
+            .expect("load first signature");
+        database
+            .handle_tx_request(second_signature, reply_sender.clone())
+            .expect("load second signature");
+        let loaded_first = match reply_receiver.try_recv().expect("first lookup") {
+            ProtocolMessage::TxDetails(record) => record,
+            other => panic!("expected transaction details, got {other:?}"),
+        };
+        let loaded_second = match reply_receiver.try_recv().expect("second lookup") {
+            ProtocolMessage::TxDetails(record) => record,
+            other => panic!("expected transaction details, got {other:?}"),
+        };
+        assert!(matches!(
+            database.handle_tx_request(first_message_hash, reply_sender),
+            Err(AggError::TxNotFound)
+        ));
+
+        let first_json = serde_json::to_value(&loaded_first).expect("json");
+        let second_json = serde_json::to_value(&loaded_second).expect("json");
+        assert_eq!(first_json, serde_json::to_value(&first_record).unwrap());
+        assert_eq!(second_json, serde_json::to_value(&second_record).unwrap());
+        for value in [&first_json, &second_json] {
+            assert!(value.get("instruction").is_some());
+            assert!(value
+                .get("metadata")
+                .and_then(|metadata| metadata.as_str())
+                .is_some());
+        }
+        assert_ne!(first_json["metadata"], second_json["metadata"]);
+        assert!(first_json["metadata"].as_str().unwrap().contains("5000"));
+        assert!(second_json["metadata"].as_str().unwrap().contains("6000"));
+    }
+
+    #[test]
+    fn missing_signature_is_rejected_without_a_fabricated_id() {
+        let (mut transaction, mut encoded) = signed_transfer(10, 1);
+        let message_hash = transaction.message.hash().to_string();
+        transaction.signatures.clear();
+        encoded.transaction = transaction.encode_with_meta(
+            UiTransactionEncoding::Base64,
+            &TransactionStatusMeta::default(),
+        );
+        let (sender, mut receiver) = unbounded_channel();
+        let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            7,
+            0,
+            1,
+            vec![encoded],
+            sender,
+        )))
+        .expect_err("missing signature");
+        assert!(matches!(error, AggError::InvalidTransactionSignature));
+        assert!(!error.to_string().contains(&message_hash));
+        assert!(receiver.try_recv().is_err());
+
+        let invalid = EncodedTransactionWithStatusMeta {
+            transaction: EncodedTransaction::Binary(
+                "not-a-transaction".to_string(),
+                solana_transaction_status::TransactionBinaryEncoding::Base64,
+            ),
+            meta: None,
+            version: None,
+        };
+        let (sender, mut receiver) = unbounded_channel();
+        let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            8,
+            0,
+            1,
+            vec![invalid],
+            sender,
+        )))
+        .expect_err("invalid transaction");
+        assert!(matches!(error, AggError::InvalidTransactionSignature));
+        assert!(receiver.try_recv().is_err());
+    }
+}

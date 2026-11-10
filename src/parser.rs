@@ -24,28 +24,28 @@ impl Parser {
             let mut partial_block = Block::default();
             for (_, tx) in txs.iter().enumerate() {
                 let mut instructions = vec![];
-                if let Some(transaction) = tx.transaction.decode() {
-                    let message = &transaction.message;
-                    for (_, instruction) in message.instructions().iter().enumerate() {
-                        if Self::is_transfer_instruction(&message, instruction)? {
-                            instructions
-                                .push(Self::decode_transfer_instruction(&message, instruction)?);
-                        }
+                let Some(transaction) = tx.transaction.decode() else {
+                    return Err(AggError::InvalidTransactionSignature);
+                };
+                let Some(signature) = transaction.signatures.first().copied() else {
+                    return Err(AggError::InvalidTransactionSignature);
+                };
+                let message = &transaction.message;
+                for (_, instruction) in message.instructions().iter().enumerate() {
+                    if Self::is_transfer_instruction(message, instruction)? {
+                        instructions.push(Self::decode_transfer_instruction(message, instruction)?);
                     }
-                    if let Some(meta) = tx.meta.clone() {
-                        let sender_account = message.static_account_keys()[0];
-                        let sender_balance = meta.post_balances[0];
-                        let receiver_account = message.static_account_keys()[1];
-                        let receiver_balance = meta.post_balances[1];
-                        partial_block.insert_account(sender_account.to_string(), sender_balance);
-                        partial_block
-                            .insert_account(receiver_account.to_string(), receiver_balance);
-                    }
-                    partial_block.push_transaction(
-                        transaction.message.hash(),
-                        TxRecord::new(instructions, tx.meta.clone()),
-                    );
                 }
+                if let Some(meta) = tx.meta.clone() {
+                    let sender_account = message.static_account_keys()[0];
+                    let sender_balance = meta.post_balances[0];
+                    let receiver_account = message.static_account_keys()[1];
+                    let receiver_balance = meta.post_balances[1];
+                    partial_block.insert_account(sender_account.to_string(), sender_balance);
+                    partial_block.insert_account(receiver_account.to_string(), receiver_balance);
+                }
+                partial_block
+                    .push_transaction(signature, TxRecord::new(instructions, tx.meta.clone()));
             }
             sender.send(ProtocolMessage::parsed_block(
                 block_no,

@@ -17,6 +17,7 @@ pub enum AggError {
     BlockNotFound,
     NoBlockFinalised,
     TxNotFound,
+    InvalidTransactionSignature,
 }
 
 impl Display for AggError {
@@ -32,6 +33,7 @@ impl Display for AggError {
             AggError::BlockNotFound => "Block Not Found".to_string(),
             AggError::NoBlockFinalised => "No Block Finalised".to_string(),
             AggError::TxNotFound => "Transaction Not Found".to_string(),
+            AggError::InvalidTransactionSignature => "Invalid transaction signature".to_string(),
             AggError::ServerError(err) => format!("Server Error {}", err),
         };
         write!(f, "{}", err_mgs)
@@ -53,6 +55,7 @@ impl Debug for AggError {
             AggError::BlockNotFound => "Block Not Found".to_string(),
             AggError::NoBlockFinalised => "No Block Finalised".to_string(),
             AggError::TxNotFound => "Transaction Not Found".to_string(),
+            AggError::InvalidTransactionSignature => "Invalid transaction signature".to_string(),
             AggError::ServerError(err) => format!("Server Error {:?}", err),
         };
         write!(f, "{}", err_mgs)
