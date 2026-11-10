@@ -153,9 +153,15 @@ impl UnprocessedBlock {
         self.total_chunks == self.total_collected_chunks
     }
 
-    pub fn insert_chunk(&mut self, chunk_no: ChunkNo, block: Block) {
+    /// Stores a valid chunk index. Returns whether this index was not already present.
+    pub fn insert_chunk(&mut self, chunk_no: ChunkNo, block: Block) -> bool {
+        if chunk_no >= self.total_chunks {
+            return false;
+        }
+        let stored_new_chunk = !self.collected_partial_blocks.contains_key(&chunk_no);
         self.collected_partial_blocks.insert(chunk_no, block);
-        self.total_collected_chunks += 1;
+        self.total_collected_chunks = self.collected_partial_blocks.len() as u64;
+        stored_new_chunk
     }
 
     pub fn complete_the_block(&self) -> Block {
@@ -191,4 +197,88 @@ impl<T> Channel<T> {
 #[derive(Deserialize)]
 pub struct QueryParams {
     pub(crate) block_no: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Block, UnprocessedBlock};
+    use solana_program::hash::Hash;
+
+    fn tx_hash(chunk_no: u64) -> Hash {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&chunk_no.to_le_bytes());
+        Hash::new_from_array(bytes)
+    }
+
+    fn partial(chunk_no: u64, balance: u64) -> Block {
+        let mut block = Block::default();
+        block.push_transaction(tx_hash(chunk_no), super::TxRecord::default());
+        block.insert_account(format!("chunk-{chunk_no}"), balance);
+        block.insert_account("merged".to_string(), balance);
+        block
+    }
+
+    fn insert_sequence(total_chunks: u64, chunks: &[(u64, u64)]) -> (UnprocessedBlock, Vec<bool>) {
+        let mut block = UnprocessedBlock::new(total_chunks);
+        let mut completed = Vec::with_capacity(chunks.len());
+        for &(chunk_no, balance) in chunks {
+            block.insert_chunk(chunk_no, partial(chunk_no, balance));
+            completed.push(block.is_complete());
+        }
+        (block, completed)
+    }
+
+    #[test]
+    fn duplicate_chunk_does_not_complete_block() {
+        let (_block, completed) = insert_sequence(2, &[(0, 1), (0, 1)]);
+        assert_eq!(completed, vec![false, false]);
+    }
+
+    #[test]
+    fn distinct_chunks_complete_block() {
+        let (block, completed) = insert_sequence(2, &[(0, 1), (1, 2)]);
+        assert_eq!(completed, vec![false, true]);
+        let merged = block.complete_the_block();
+        assert!(merged.get_tx_details(&tx_hash(0).to_string()).is_some());
+        assert!(merged.get_tx_details(&tx_hash(1).to_string()).is_some());
+        assert_eq!(merged.get_account_balance("merged"), Some(2));
+    }
+
+    #[test]
+    fn out_of_order_chunks_merge_in_chunk_index_order() {
+        let (block, completed) = insert_sequence(2, &[(1, 2), (0, 1)]);
+        assert_eq!(completed, vec![false, true]);
+        let merged = block.complete_the_block();
+        assert!(merged.get_tx_details(&tx_hash(0).to_string()).is_some());
+        assert!(merged.get_tx_details(&tx_hash(1).to_string()).is_some());
+        assert_eq!(merged.get_account_balance("chunk-0"), Some(1));
+        assert_eq!(merged.get_account_balance("chunk-1"), Some(2));
+        assert_eq!(merged.get_account_balance("merged"), Some(2));
+    }
+
+    #[test]
+    fn block_completes_only_after_missing_chunk_arrives() {
+        let (block, completed) = insert_sequence(2, &[(0, 1), (0, 1), (1, 2)]);
+        assert_eq!(completed, vec![false, false, true]);
+        let merged = block.complete_the_block();
+        assert!(merged.get_tx_details(&tx_hash(0).to_string()).is_some());
+        assert!(merged.get_tx_details(&tx_hash(1).to_string()).is_some());
+    }
+
+    #[test]
+    fn repeated_chunk_leaves_three_chunk_block_incomplete() {
+        let (_block, completed) = insert_sequence(3, &[(0, 1), (0, 1), (1, 2)]);
+        assert_eq!(completed, vec![false, false, false]);
+    }
+
+    #[test]
+    fn three_distinct_chunks_complete_block() {
+        let (block, completed) = insert_sequence(3, &[(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(completed, vec![false, false, true]);
+        let merged = block.complete_the_block();
+        assert_eq!(merged.get_account_balance("chunk-0"), Some(1));
+        assert_eq!(merged.get_account_balance("chunk-1"), Some(2));
+        assert_eq!(merged.get_account_balance("chunk-2"), Some(3));
+        assert_eq!(merged.get_account_balance("merged"), Some(3));
+    }
 }

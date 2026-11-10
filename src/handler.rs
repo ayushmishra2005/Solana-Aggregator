@@ -89,8 +89,8 @@ impl Handler {
         block: Block,
     ) -> Result<(), AggError> {
         if let Some(unprocessed_block) = self.unprocessed_block_collector.get_mut(&block_no) {
-            unprocessed_block.insert_chunk(chunk_no, block);
-            if unprocessed_block.is_complete() {
+            let stored_new_chunk = unprocessed_block.insert_chunk(chunk_no, block);
+            if stored_new_chunk && unprocessed_block.is_complete() {
                 let complete_block = unprocessed_block.complete_the_block();
                 self.unprocessed_block_collector.remove(&block_no);
                 self.db_sender
@@ -98,8 +98,8 @@ impl Handler {
             }
         } else {
             let mut unprocessed_block = UnprocessedBlock::new(total_chunks);
-            unprocessed_block.insert_chunk(chunk_no, block);
-            if unprocessed_block.is_complete() {
+            let stored_new_chunk = unprocessed_block.insert_chunk(chunk_no, block);
+            if stored_new_chunk && unprocessed_block.is_complete() {
                 let complete_block = unprocessed_block.complete_the_block();
                 self.unprocessed_block_collector.remove(&block_no);
                 self.db_sender
@@ -223,5 +223,33 @@ impl Handler {
         {
             error!(target: "handler", "Error from db_sender {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Handler;
+    use crate::util::{Block, ProtocolMessage};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn duplicate_chunk_finalizes_a_completed_block_only_once() {
+        let (_incoming_sender, incoming) = unbounded_channel();
+        let (db_sender, mut db_receiver) = unbounded_channel();
+        let mut handler = Handler::initialize(incoming, db_sender);
+        let chunk = Block::default();
+
+        handler
+            .handle_unprocessed_block(7, 1, 0, chunk.clone())
+            .expect("first chunk");
+        match db_receiver.try_recv() {
+            Ok(ProtocolMessage::FinalizeBlock(slot, _)) => assert_eq!(slot, 7),
+            other => panic!("expected one finalized block, got {other:?}"),
+        }
+
+        handler
+            .handle_unprocessed_block(7, 1, 0, chunk)
+            .expect("duplicate chunk");
+        assert!(db_receiver.try_recv().is_err());
     }
 }
