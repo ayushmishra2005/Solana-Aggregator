@@ -58,7 +58,6 @@ pub struct RocksDb {
 }
 
 impl RocksDb {
-
     /// This function initializes the RocksDb client
     ///
     /// # Arguments

@@ -23,7 +23,6 @@ pub struct Handler {
 }
 
 impl Handler {
-
     /// This function initializes the handler
     ///
     /// # Arguments

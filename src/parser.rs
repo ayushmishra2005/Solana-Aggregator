@@ -36,7 +36,6 @@ fn sol_amount(lamports: u64) -> f64 {
 pub struct Parser;
 
 impl Parser {
-
     /// This function invokes the parser
     ///
     /// # Arguments
@@ -264,7 +263,6 @@ impl Parser {
             .map(|key| Pubkey::from_str(key).map_err(|_| ()))
             .collect()
     }
-
 }
 
 #[cfg(test)]

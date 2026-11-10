@@ -55,7 +55,6 @@ impl ApiState {
 pub(crate) struct AggServer;
 
 impl AggServer {
-
     /// This function runs the server
     ///
     /// # Arguments

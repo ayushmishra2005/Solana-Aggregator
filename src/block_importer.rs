@@ -198,7 +198,6 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-
     /// This function initializes the subscriber client
     ///
     /// # Arguments
@@ -459,7 +458,6 @@ impl Drop for Subscriber {
 struct BlockFetcher;
 
 impl BlockFetcher {
-
     async fn invoke(
         client: &RpcClient,
         message: ProtocolMessage,
