@@ -15,6 +15,28 @@ mod parser;
 mod server;
 mod util;
 
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Error
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}: {}", record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_stderr_logger() {
+    static LOGGER: StderrLogger = StderrLogger;
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Error);
+}
+
 fn resume_subscriber(
     subscriber: &mut block_importer::Subscriber,
     database: &mut db_handler::RocksDb,
@@ -31,6 +53,7 @@ fn resume_subscriber(
 
 #[tokio::main]
 async fn main() {
+    install_stderr_logger();
     let opt: Cli = Cli::from_args();
     let handler_channel = Channel::<ProtocolMessage>::new();
     let db_channel = Channel::<ProtocolMessage>::new();
@@ -44,6 +67,7 @@ async fn main() {
         Ok(subscriber) => subscriber,
         Err(e) => {
             error!(target:"subscriber", "Error from subscriber client {}",e);
+            eprintln!("Fatal subscriber failure: {e}");
             return;
         }
     };
@@ -61,12 +85,14 @@ async fn main() {
         Ok(db) => db,
         Err(e) => {
             error!(target:"db", "Error from db client {}",e);
+            eprintln!("Fatal database failure: {e}");
             return;
         }
     };
     db_client.set_block_outcomes(block_outcome_sender);
     if let Err(error) = resume_subscriber(&mut subscriber_client, &mut db_client) {
         error!(target: "subscriber", "Error restoring slot checkpoint {}", error);
+        eprintln!("Fatal subscriber failure: {error}");
         return;
     }
     tokio::spawn(async move {
@@ -75,10 +101,19 @@ async fn main() {
     tokio::spawn(async move {
         handler.run().await;
     });
-    tokio::spawn(async move {
-        subscriber_client.run().await;
-    });
-    if let Err(error) = server::AggServer::run(handler_channel_receiver_server, opt.port_no).await {
-        error!(target:"server", "Error from server client {}",error);
+    let server = server::AggServer::run(handler_channel_receiver_server, opt.port_no);
+    tokio::pin!(server);
+    tokio::select! {
+        result = subscriber_client.run() => {
+            if let Err(error) = result {
+                eprintln!("Fatal subscriber failure: {error}");
+            }
+        }
+        result = &mut server => {
+            if let Err(error) = result {
+                error!(target:"server", "Error from server client {}", error);
+                eprintln!("Fatal server failure: {error}");
+            }
+        }
     }
 }

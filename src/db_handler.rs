@@ -774,12 +774,14 @@ mod tests {
     use crate::error::AggError;
     use crate::parser::Parser;
     use crate::util::ProtocolMessage;
-    use solana_sdk::hash::Hash;
-    use solana_sdk::message::Message;
-    use solana_sdk::pubkey::Pubkey;
-    use solana_sdk::signature::{Keypair, Signer};
-    use solana_sdk::system_instruction;
-    use solana_sdk::transaction::{Transaction, TransactionVersion, VersionedTransaction};
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
+    use solana_message::Message;
+    use solana_pubkey::Pubkey;
+    use solana_signer::Signer;
+    use solana_system_interface::instruction as system_instruction;
+    use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
+    use solana_transaction::Transaction;
     use solana_transaction_status::{
         EncodableWithMeta, EncodedTransaction, EncodedTransactionWithStatusMeta,
         TransactionStatusMeta, UiTransactionEncoding, UiTransactionStatusMeta,
@@ -1020,7 +1022,7 @@ mod tests {
         db.set_block_outcomes(outcome_sender);
         let mut block = crate::util::Block::default();
         block.push_transaction(
-            solana_sdk::signature::Signature::from([4; 64]),
+            solana_signature::Signature::from([4; 64]),
             crate::util::TxRecord::default(),
         );
         db.establish_initial_checkpoint(3).expect("start boundary");
@@ -1030,7 +1032,7 @@ mod tests {
             outcome_receiver.try_recv(),
             Ok(ProtocolMessage::BlockProcessingResult(15, Ok(())))
         ));
-        let signature = solana_sdk::signature::Signature::from([4; 64]).to_string();
+        let signature = solana_signature::Signature::from([4; 64]).to_string();
         let (server_sender, mut server_receiver) = unbounded_channel();
         db.handle_tx_request(signature.clone(), server_sender)
             .expect("signature lookup");
@@ -1119,7 +1121,7 @@ mod tests {
                 .expect("open");
         let mut block = crate::util::Block::default();
         block.push_transaction(
-            solana_sdk::signature::Signature::from([7; 64]),
+            solana_signature::Signature::from([7; 64]),
             crate::util::TxRecord::default(),
         );
         block.insert_account("payer".to_string(), 42);
@@ -1136,7 +1138,7 @@ mod tests {
         assert_eq!(database.get_block(3), stored);
         let mut changed = crate::util::Block::default();
         changed.push_transaction(
-            solana_sdk::signature::Signature::from([8; 64]),
+            solana_signature::Signature::from([8; 64]),
             crate::util::TxRecord::default(),
         );
         let conflict = database.handle_block(3, changed, 3);

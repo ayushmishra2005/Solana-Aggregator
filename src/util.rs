@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_config::RpcBlockConfig;
-use solana_program::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use solana_transaction_status::{EncodedTransactionWithStatusMeta, UiTransactionStatusMeta};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -233,7 +233,7 @@ pub struct QueryParams {
 #[cfg(test)]
 mod tests {
     use super::{Block, UnprocessedBlock};
-    use solana_sdk::signature::Signature;
+    use solana_signature::Signature;
 
     fn tx_signature(chunk_no: u64) -> Signature {
         let mut bytes = [0u8; 64];

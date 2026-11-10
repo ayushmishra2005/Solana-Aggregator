@@ -1,6 +1,6 @@
 use crate::util::ProtocolMessage;
 use solana_client::client_error::ClientError;
-use solana_program::pubkey::ParsePubkeyError;
+use solana_pubkey::ParsePubkeyError;
 use std::array::TryFromSliceError;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::Error;

@@ -10,7 +10,7 @@ use solana_client::rpc_custom_error::{
     JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET, JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
 };
 use solana_client::rpc_request::RpcError;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_transaction_status::{UiConfirmedBlock, UiTransactionEncoding};
 use std::future::Future;
 use std::time::Duration;
@@ -27,11 +27,22 @@ enum BlockFetch {
     Failed(AggError),
 }
 
+#[derive(Debug)]
 enum SlotProgress {
     CaughtUp,
     Advanced,
-    Halted,
+    Halted(String),
     SlotQueryFailed,
+}
+
+fn finalized_block_config() -> RpcBlockConfig {
+    RpcBlockConfig {
+        encoding: Some(UiTransactionEncoding::Base64),
+        transaction_details: None,
+        rewards: None,
+        commitment: Some(CommitmentConfig::finalized()),
+        max_supported_transaction_version: Some(1),
+    }
 }
 
 pub struct Subscriber {
@@ -61,13 +72,7 @@ impl Subscriber {
         message_sender: UnboundedSender<ProtocolMessage>,
     ) -> Result<Self, AggError> {
         let rpc_client = RpcClient::new(&chain_url);
-        let rpc_block_config = RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            transaction_details: None,
-            rewards: None,
-            commitment: Some(CommitmentConfig::finalized()),
-            max_supported_transaction_version: Some(0),
-        };
+        let rpc_block_config = finalized_block_config();
         let latest_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::finalized())?;
         Ok(Self {
             latest_slot,
@@ -104,11 +109,13 @@ impl Subscriber {
         Ok(slot)
     }
 
-    /// This function runs the subscriber client
-    pub async fn run(&mut self) {
+    /// Runs until the finalized tip is caught up, or returns the fatal reason.
+    /// A returned error means the in-memory cursor did not advance.
+    pub async fn run(&mut self) -> Result<(), String> {
         loop {
-            if matches!(self.advance_once().await, SlotProgress::Halted) {
-                break;
+            if let SlotProgress::Halted(reason) = self.advance_once().await {
+                error!(target: "subscriber", "{reason}");
+                return Err(reason);
             }
         }
     }
@@ -146,24 +153,18 @@ impl Subscriber {
                     .send(ProtocolMessage::RecordSkippedSlot(slot))
                     .is_err()
                 {
-                    error!(
-                        target: "subscriber",
+                    return SlotProgress::Halted(format!(
                         "Stopping slot progression at {slot}: database channel closed"
-                    );
-                    return SlotProgress::Halted;
+                    ));
                 }
                 match self.wait_for_block(slot).await {
                     Ok(()) => {
                         self.latest_slot = slot;
                         SlotProgress::Advanced
                     }
-                    Err(err) => {
-                        error!(
-                            target: "subscriber",
-                            "Stopping slot progression at {slot} after skipped-slot checkpoint failed: {err}"
-                        );
-                        SlotProgress::Halted
-                    }
+                    Err(err) => SlotProgress::Halted(format!(
+                        "Stopping slot progression at {slot} after skipped-slot checkpoint failed: {err}"
+                    )),
                 }
             }
             BlockFetch::Fetched(_) => match self.wait_for_block(slot).await {
@@ -171,21 +172,13 @@ impl Subscriber {
                     self.latest_slot = slot;
                     SlotProgress::Advanced
                 }
-                Err(err) => {
-                    error!(
-                        target: "subscriber",
-                        "Stopping slot progression at {slot} after block processing failed: {err}"
-                    );
-                    SlotProgress::Halted
-                }
+                Err(err) => SlotProgress::Halted(format!(
+                    "Stopping slot progression at {slot} after block processing failed: {err}"
+                )),
             },
-            BlockFetch::Failed(err) => {
-                error!(
-                    target: "subscriber",
-                    "Stopping slot progression at {slot} after getBlock failed: {err:?}"
-                );
-                SlotProgress::Halted
-            }
+            BlockFetch::Failed(err) => SlotProgress::Halted(format!(
+                "Stopping slot progression at {slot} after getBlock failed: {err:?}"
+            )),
         }
     }
 
@@ -479,7 +472,7 @@ mod tests {
     use solana_client::rpc_config::RpcBlockConfig;
     use solana_client::rpc_request::RpcRequest;
     use solana_client::rpc_sender::{RpcSender, RpcTransportStats};
-    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_commitment_config::CommitmentConfig;
     use solana_transaction_status::UiTransactionEncoding;
     use std::future::Future;
     use std::pin::Pin;
@@ -524,13 +517,7 @@ mod tests {
             RpcClientConfig::with_commitment(CommitmentConfig::finalized()),
         );
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let config = RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            transaction_details: None,
-            rewards: None,
-            commitment: Some(CommitmentConfig::finalized()),
-            max_supported_transaction_version: Some(0),
-        };
+        let config = super::finalized_block_config();
 
         block_on(BlockFetcher::request_block(
             &client, slot, config, sender, None,
@@ -547,6 +534,14 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("finalized"),
             "block fetch must keep the finalized commitment"
+        );
+        assert_eq!(
+            params
+                .get(1)
+                .and_then(|config| config.get("maxSupportedTransactionVersion"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "getBlock must request transaction version 1 as a JSON integer"
         );
         params[0].as_u64().expect("getBlock slot")
     }
@@ -627,7 +622,7 @@ mod tests {
             transaction_details: None,
             rewards: None,
             commitment: Some(CommitmentConfig::finalized()),
-            max_supported_transaction_version: Some(0),
+            max_supported_transaction_version: Some(1),
         };
         let raw = client
             .get_block_with_config(100, config)
@@ -687,13 +682,14 @@ mod tests {
         JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
         JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET,
         JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED, JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
+        JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
     };
     use solana_client::rpc_request::RpcResponseErrorData;
-    use solana_program::hash::Hash;
-    use solana_program::message::{MessageHeader, VersionedMessage};
-    use solana_program::pubkey::Pubkey;
-    use solana_sdk::signature::Signature;
-    use solana_sdk::transaction::VersionedTransaction;
+    use solana_hash::Hash;
+    use solana_message::{MessageHeader, VersionedMessage};
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+    use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
     use solana_transaction_status::{
         EncodableWithMeta, EncodedTransactionWithStatusMeta, TransactionStatusMeta,
         UiConfirmedBlock,
@@ -742,13 +738,7 @@ mod tests {
     }
 
     fn block_config() -> RpcBlockConfig {
-        RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            transaction_details: None,
-            rewards: None,
-            commitment: Some(CommitmentConfig::finalized()),
-            max_supported_transaction_version: Some(0),
-        }
+        super::finalized_block_config()
     }
 
     fn scripted_client(responses: Vec<RpcResult<serde_json::Value>>) -> (RpcClient, RecordedCalls) {
@@ -842,7 +832,7 @@ mod tests {
         let signature = Signature::from([8u8; 64]);
         let versioned = VersionedTransaction {
             signatures: vec![signature],
-            message: VersionedMessage::Legacy(solana_program::message::Message {
+            message: VersionedMessage::Legacy(solana_message::Message {
                 header: MessageHeader {
                     num_required_signatures: 1,
                     num_readonly_signed_accounts: 0,
@@ -868,7 +858,7 @@ mod tests {
                 }))
                 .expect("transaction metadata"),
             ),
-            version: Some(solana_sdk::transaction::TransactionVersion::LEGACY),
+            version: Some(TransactionVersion::LEGACY),
         };
         (encoded, signature.to_string(), account.to_string())
     }
@@ -1483,7 +1473,7 @@ mod tests {
 
             assert!(matches!(
                 subscriber.advance_once().await,
-                SlotProgress::Halted
+                SlotProgress::Halted(_)
             ));
             assert_eq!(subscriber.latest_slot, 102);
             assert_eq!(
@@ -1494,15 +1484,46 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_transaction_version_stops_without_skipping() {
+        block_on(async {
+            let (mut subscriber, calls, mut receiver) = progression_subscriber(
+                100,
+                110,
+                vec![Err(rpc_failure(
+                    JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
+                    "Transaction version (2) is not supported".to_string(),
+                ))],
+            );
+            let progress = subscriber.advance_once().await;
+            match progress {
+                SlotProgress::Halted(reason) => {
+                    assert!(reason.contains("at 101"), "{reason}");
+                    assert!(reason.contains("not supported"), "{reason}");
+                    assert!(!reason.contains("was skipped"), "{reason}");
+                }
+                other => panic!("unsupported version must halt, got {other:?}"),
+            }
+            assert_eq!(subscriber.latest_slot, 100);
+            assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
     fn subscriber_stops_when_a_slot_remains_unresolved() {
         let secret = format!("http://127.0.0.1/?api-key={RPC_SECRET}");
         let (mut subscriber, calls, mut receiver) =
             progression_subscriber(100, 110, vec![Err(rpc_failure(-32602, secret.clone()))]);
         let logged = capture_fetch_logs(|| {
             block_on(async {
-                tokio::time::timeout(Duration::from_secs(2), subscriber.run())
+                let result = tokio::time::timeout(Duration::from_secs(2), subscriber.run())
                     .await
                     .expect("subscriber stopped after the failed slot");
+                let error = result.expect_err("failed fetch is fatal");
+                assert!(error.contains("at 101"), "{error}");
+                assert!(error.contains("getBlock failed"), "{error}");
+                assert!(!error.contains(RPC_SECRET), "{error}");
+                assert!(!error.contains("api-key="), "{error}");
             });
         });
         assert_eq!(subscriber.latest_slot, 100);
@@ -1528,9 +1549,11 @@ mod tests {
         }
         let (mut subscriber, calls, mut receiver) = progression_subscriber(50, 80, failures);
         block_on(async {
-            tokio::time::timeout(Duration::from_secs(3), subscriber.run())
+            let result = tokio::time::timeout(Duration::from_secs(3), subscriber.run())
                 .await
                 .expect("subscriber stopped after retry exhaustion");
+            let error = result.expect_err("exhausted retries are fatal");
+            assert!(error.contains("at 51"), "{error}");
         });
         assert_eq!(subscriber.latest_slot, 50);
         assert_eq!(
@@ -1561,7 +1584,7 @@ mod tests {
             subscriber.outcome_rx = Some(outcome_receiver);
             assert!(matches!(
                 subscriber.advance_once().await,
-                SlotProgress::Halted
+                SlotProgress::Halted(_)
             ));
             assert_eq!(subscriber.latest_slot, 100);
             assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
@@ -1639,7 +1662,7 @@ mod tests {
             subscriber.set_block_outcomes(outcome_sender, outcome_receiver);
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(2), subscriber.advance_once()).await,
-                Ok(SlotProgress::Halted)
+                Ok(SlotProgress::Halted(_))
             ));
             assert_eq!(subscriber.latest_slot, 100);
             assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
@@ -1675,7 +1698,7 @@ mod tests {
             });
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(2), subscriber.advance_once()).await,
-                Ok(SlotProgress::Halted)
+                Ok(SlotProgress::Halted(_))
             ));
             assert_eq!(subscriber.latest_slot, 100);
             assert_eq!(block_requests(&calls.lock().expect("calls")), vec![101]);
@@ -1693,7 +1716,7 @@ mod tests {
             subscriber.resume_from_checkpoint(20);
             assert!(matches!(
                 subscriber.advance_once().await,
-                SlotProgress::Halted
+                SlotProgress::Halted(_)
             ));
             assert_eq!(subscriber.latest_slot, 20);
             assert_eq!(block_requests(&calls.lock().expect("calls")), vec![21]);
@@ -1757,7 +1780,7 @@ mod tests {
                 progression_subscriber(100, 110, vec![Ok(value)]);
             assert!(matches!(
                 subscriber.advance_once().await,
-                SlotProgress::Halted
+                SlotProgress::Halted(_)
             ));
             assert_eq!(subscriber.latest_slot, 100);
             assert!(receiver.try_recv().is_err());

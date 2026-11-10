@@ -1,7 +1,7 @@
 use crate::error::AggError;
 use crate::util::{Block, ChunkReject, ProtocolMessage, UnprocessedBlock};
 use log::error;
-use solana_program::clock::Slot;
+use solana_clock::Slot;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 

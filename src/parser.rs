@@ -1,10 +1,10 @@
 use crate::error::AggError;
 use crate::util::{Block, Instruction, ProtocolMessage, TxRecord};
 use log::debug;
-use solana_program::instruction::CompiledInstruction;
-use solana_program::message::VersionedMessage;
-use solana_program::pubkey::Pubkey;
-use solana_program::system_program;
+use solana_message::compiled_instruction::CompiledInstruction;
+use solana_message::VersionedMessage;
+use solana_pubkey::Pubkey;
+use solana_system_interface::program as system_program;
 use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::UiTransactionStatusMeta;
 use std::str::FromStr;
@@ -270,15 +270,19 @@ mod tests {
     use super::{DecodedTransfer, Parser};
     use crate::error::AggError;
     use crate::util::{Block, Instruction, ProtocolMessage};
-    use solana_program::hash::Hash;
-    use solana_program::instruction::CompiledInstruction;
-    use solana_program::message::v0::{self, MessageAddressTableLookup};
-    use solana_program::message::{Message, MessageHeader, VersionedMessage};
-    use solana_program::pubkey::Pubkey;
-    use solana_program::system_instruction::{self, SystemInstruction};
-    use solana_program::system_program;
-    use solana_sdk::signature::{Keypair, Signature, Signer};
-    use solana_sdk::transaction::{Transaction, TransactionVersion, VersionedTransaction};
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
+    use solana_message::compiled_instruction::CompiledInstruction;
+    use solana_message::v0::{self, MessageAddressTableLookup};
+    use solana_message::{Message, MessageHeader, VersionedMessage};
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+    use solana_signer::Signer;
+    use solana_system_interface::instruction::{self as system_instruction, SystemInstruction};
+    use solana_system_interface::program as system_program;
+    use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
+    use solana_transaction::Transaction;
+    use solana_transaction_error::TransactionError;
     use solana_transaction_status::option_serializer::OptionSerializer;
     use solana_transaction_status::{
         EncodableWithMeta, EncodedTransactionWithStatusMeta, TransactionStatusMeta,
@@ -348,7 +352,7 @@ mod tests {
             .expect("sign failed transfer");
         let versioned = VersionedTransaction::from(transaction);
         let mut meta = balances_meta(vec![9, 8, 1]);
-        meta.err = Some(solana_sdk::transaction::TransactionError::InsufficientFundsForFee);
+        meta.err = Some(TransactionError::InsufficientFundsForFee.into());
         let encoded = EncodedTransactionWithStatusMeta {
             transaction: versioned.encode_with_meta(
                 UiTransactionEncoding::Base64,
@@ -1525,5 +1529,112 @@ mod tests {
             serde_json::to_string(&loaded_value["instruction"][0]).unwrap(),
             serde_json::to_string(&loaded.instruction()).unwrap()
         );
+    }
+
+    fn v1_transfer(
+        lamports: u64,
+    ) -> (
+        VersionedTransaction,
+        EncodedTransactionWithStatusMeta,
+        Keypair,
+        Pubkey,
+    ) {
+        let source = Keypair::new();
+        let destination = account(30);
+        let instruction = system_instruction::transfer(&source.pubkey(), &destination, lamports);
+        let message = solana_message::v1::Message::try_compile_with_config(
+            &source.pubkey(),
+            &[instruction],
+            Hash::new_from_array([9; 32]),
+            solana_message::v1::TransactionConfig::empty(),
+        )
+        .expect("compile v1 message");
+        let versioned = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&source])
+            .expect("sign v1 transfer");
+        let encoded = EncodedTransactionWithStatusMeta {
+            transaction: versioned.encode_with_meta(
+                UiTransactionEncoding::Base64,
+                &TransactionStatusMeta::default(),
+            ),
+            meta: Some(balances_meta(vec![80, 20, 1])),
+            version: Some(TransactionVersion::Number(1)),
+        };
+        (versioned, encoded, source, destination)
+    }
+
+    #[test]
+    fn v1_transaction_decodes_transfer_balances_and_first_signature() {
+        let lamports = 2_500_000_000;
+        let (versioned, encoded, source, destination) = v1_transfer(lamports);
+        assert!(matches!(versioned.message, VersionedMessage::V1(_)));
+        assert!(versioned.message.address_table_lookups().is_none());
+        let decoded = encoded
+            .transaction
+            .decode()
+            .expect("wincode decoder accepts the v1 fixture");
+        assert_eq!(decoded.signatures[0], versioned.signatures[0]);
+        assert!(matches!(decoded.message, VersionedMessage::V1(_)));
+        assert_eq!(decoded.message.static_account_keys().len(), 3);
+        let block = parse_accounts(encoded);
+        let signature = versioned.signatures[0].to_string();
+        let value = transfer_json(&block, &signature);
+        assert_eq!(
+            value["instruction"][0],
+            serde_json::to_value(Instruction::transfer(
+                source.pubkey(),
+                destination,
+                lamports as f64 / 1_000_000_000.0
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            block.get_account_balance(&source.pubkey().to_string()),
+            Some(80)
+        );
+        assert_eq!(
+            block.get_account_balance(&destination.to_string()),
+            Some(20)
+        );
+        assert_eq!(
+            block.get_account_balance(&system_program::id().to_string()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn v1_failed_transaction_keeps_balances_without_a_transfer() {
+        let (versioned, mut encoded, source, _destination) = v1_transfer(9);
+        encoded.meta.as_mut().expect("meta").err =
+            Some(TransactionError::InsufficientFundsForFee.into());
+        let block = parse_accounts(encoded);
+        let value = transfer_json(&block, &versioned.signatures[0].to_string());
+        assert_eq!(value["instruction"], serde_json::json!([]));
+        assert_eq!(
+            block.get_account_balance(&source.pubkey().to_string()),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn malformed_v1_transaction_is_rejected_without_panicking() {
+        let (_versioned, mut encoded, _source, _destination) = v1_transfer(1);
+        let solana_transaction_status::EncodedTransaction::Binary(blob, encoding) =
+            &mut encoded.transaction
+        else {
+            panic!("v1 fixture is base64");
+        };
+        blob.truncate(8);
+        let _ = encoding;
+        let (sender, mut receiver) = unbounded_channel();
+        let error = block_on(Parser::invoke(ProtocolMessage::new_chuck(
+            1,
+            0,
+            1,
+            vec![encoded],
+            sender,
+        )))
+        .expect_err("malformed v1 transaction");
+        assert!(matches!(error, AggError::InvalidTransactionSignature));
+        assert!(receiver.try_recv().is_err());
     }
 }
