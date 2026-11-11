@@ -6,7 +6,7 @@ Off-chain Rust indexer for finalized Solana blocks. It stores transactions, Syst
 
 ## Capabilities
 
-- Finalized `getSlot` / `getBlock` through one nonblocking RPC client, with `maxSupportedTransactionVersion: 1` (legacy, v0, and v1).
+- Finalized `getSlot` / `getBlock` through one nonblocking RPC client, with `maxSupportedTransactionVersion: 1` (legacy, v0 and v1).
 - Four parser workers and bounded channels. A slow stage blocks the producer instead of allocating without limit.
 - Canonical first-signature index. V0 address-lookup-table accounts are resolved from the block's loaded addresses.
 - System Program transfers keep the exact `u64` lamport amount. The historical SOL field is still present and is not exact above 2^53 lamports.
